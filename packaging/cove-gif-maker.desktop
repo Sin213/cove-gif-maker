@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Cove GIF Maker
+GenericName=Video to GIF Converter
+Comment=Trim videos and convert them to optimized GIFs
+Exec=cove-gif-maker
+Icon=video-x-generic
+Terminal=false
+Categories=AudioVideo;Video;Utility;
+Keywords=gif;video;ffmpeg;trim;webp;convert;
+StartupNotify=true
+MimeType=video/mp4;video/x-matroska;video/webm;video/quicktime;video/x-msvideo;
