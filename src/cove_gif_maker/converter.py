@@ -4,7 +4,7 @@ import os
 import subprocess
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, Signal
@@ -34,6 +34,14 @@ class ConvertJob:
     webp_quality: int = 80
     optimize_with_gifsicle: bool = True
     crop: tuple[int, int, int, int] | None = None  # x, y, w, h in source pixels
+    reverse: bool = False
+    boomerang: bool = False
+    captions: list[ff.Caption] = field(default_factory=list)
+    # Source video dimensions — required when captions are set so the
+    # renderer can produce the burn-in PNG at the right resolution. App
+    # fills these from probe().
+    source_width: int = 0
+    source_height: int = 0
 
 
 class ConvertWorker(QObject):
@@ -75,8 +83,32 @@ class ConvertWorker(QObject):
 
     # --- format-specific pipelines -------------------------------------
 
+    def _render_caption_png(self, job: ConvertJob, tmp: str) -> Path | None:
+        """Burn all captions onto a single transparent PNG at source res.
+
+        The bundled static ffmpeg lacks `drawtext`, so we render via Qt and
+        composite later with the universally-available `overlay` filter.
+        Returns None when no caption has any text — that lets the cmd
+        builders skip the extra input + filter_complex graph."""
+        non_empty = [
+            c for c in (job.captions or [])
+            if c.text and c.text.strip()
+        ]
+        if not non_empty:
+            return None
+        if not job.source_width or not job.source_height:
+            self.log.emit("Caption skipped: source dimensions unknown")
+            return None
+        from . import caption_render  # local import — keeps module import cheap
+        out = Path(tmp) / "caption.png"
+        caption_render.render_many_to_png(
+            non_empty, job.source_width, job.source_height, out,
+        )
+        return out
+
     def _run_gif(self, job: ConvertJob) -> None:
         with tempfile.TemporaryDirectory(prefix="cove-gif-") as tmp:
+            caption_png = self._render_caption_png(job, tmp)
             palette = Path(tmp) / "palette.png"
             self.log.emit("Generating palette...")
             self._run_ffmpeg(
@@ -84,6 +116,7 @@ class ConvertWorker(QObject):
                     job.video, job.start, job.end, palette,
                     fps=job.fps, scale_pct=job.scale_pct, speed=job.speed,
                     palette_colors=job.palette_colors, crop=job.crop,
+                    caption_png=caption_png,
                 ),
                 phase_start=0, phase_span=30,
             )
@@ -95,8 +128,11 @@ class ConvertWorker(QObject):
                     job.video, job.start, job.end, palette, job.output,
                     fps=job.fps, scale_pct=job.scale_pct, speed=job.speed,
                     loop=job.loop, crop=job.crop,
+                    reverse=job.reverse, boomerang=job.boomerang,
+                    caption_png=caption_png,
                 ),
                 phase_start=30, phase_span=60,
+                dur_multiplier=2.0 if job.boomerang else 1.0,
             )
             if self._cancelled:
                 return
@@ -109,19 +145,27 @@ class ConvertWorker(QObject):
             self.progress.emit(100)
 
     def _run_webp(self, job: ConvertJob) -> None:
-        self.log.emit("Rendering WebP...")
-        self._run_ffmpeg(
-            ff.build_webp_cmd(
-                job.video, job.start, job.end, job.output,
-                fps=job.fps, scale_pct=job.scale_pct, speed=job.speed,
-                loop=job.loop, quality=job.webp_quality, crop=job.crop,
-            ),
-            phase_start=0, phase_span=100,
-        )
+        with tempfile.TemporaryDirectory(prefix="cove-webp-") as tmp:
+            caption_png = self._render_caption_png(job, tmp)
+            self.log.emit("Rendering WebP...")
+            self._run_ffmpeg(
+                ff.build_webp_cmd(
+                    job.video, job.start, job.end, job.output,
+                    fps=job.fps, scale_pct=job.scale_pct, speed=job.speed,
+                    loop=job.loop, quality=job.webp_quality, crop=job.crop,
+                    reverse=job.reverse, boomerang=job.boomerang,
+                    caption_png=caption_png,
+                ),
+                phase_start=0, phase_span=100,
+                dur_multiplier=2.0 if job.boomerang else 1.0,
+            )
 
     # --- subprocess helpers --------------------------------------------
 
-    def _run_ffmpeg(self, cmd: list[str], *, phase_start: int, phase_span: int) -> None:
+    def _run_ffmpeg(
+        self, cmd: list[str], *, phase_start: int, phase_span: int,
+        dur_multiplier: float = 1.0,
+    ) -> None:
         self.log.emit("$ " + " ".join(cmd))
         # Inject -progress (newline-separated key=value on stdout) and quiet stderr
         cmd = [cmd[0], "-progress", "pipe:1", "-nostats", "-loglevel", "error"] + cmd[1:]
@@ -133,7 +177,7 @@ class ConvertWorker(QObject):
             bufsize=1,
             **_POPEN_KWARGS,
         )
-        clip_dur = max(0.01, self._job.end - self._job.start)
+        clip_dur = max(0.01, (self._job.end - self._job.start) * dur_multiplier)
         assert self._proc.stdout is not None
         for line in self._proc.stdout:
             if self._cancelled:
