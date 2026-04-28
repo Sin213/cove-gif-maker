@@ -55,6 +55,4 @@ def start_thumbnails(video: Path, duration: float, count: int = 24) -> tuple[QTh
     thread.started.connect(worker.run)
     worker.finished.connect(thread.quit)
     worker.failed.connect(thread.quit)
-    thread.finished.connect(worker.deleteLater)
-    thread.finished.connect(thread.deleteLater)
     return thread, worker

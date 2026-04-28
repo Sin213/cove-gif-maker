@@ -250,39 +250,49 @@ class ConvertWorker(QObject):
         dur_multiplier: float = 1.0,
     ) -> None:
         self.log.emit("$ " + " ".join(cmd))
-        # Inject -progress (newline-separated key=value on stdout) and quiet stderr
         cmd = [cmd[0], "-progress", "pipe:1", "-nostats", "-loglevel", "error"] + cmd[1:]
-        self._proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-            **_POPEN_KWARGS,
+        stderr_file = tempfile.NamedTemporaryFile(
+            mode="w+", prefix="cove-ffstderr-", suffix=".txt", delete=False,
         )
-        clip_dur = max(0.01, (self._job.end - self._job.start) * dur_multiplier)
-        assert self._proc.stdout is not None
-        for line in self._proc.stdout:
-            if self._cancelled:
-                self._proc.terminate()
-                break
-            line = line.strip()
-            if not line:
-                continue
-            key, _, value = line.partition("=")
-            if key in ("out_time_us", "out_time_ms") and value.lstrip("-").isdigit():
-                t = int(value) / 1_000_000  # both keys carry microseconds in modern ffmpeg
-                pct = min(1.0, max(0.0, t / clip_dur))
-                overall = phase_start + pct * phase_span
-                self.progress.emit(int(overall))
-                self._update_eta(overall)
-            elif key == "progress" and value == "end":
-                self.progress.emit(phase_start + phase_span)
-                break
-        rc = self._proc.wait()
-        if rc != 0 and not self._cancelled:
-            err = self._proc.stderr.read() if self._proc.stderr else ""
-            raise RuntimeError(f"ffmpeg exited with code {rc}: {err.strip()[-300:]}")
+        try:
+            self._proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=stderr_file,
+                text=True,
+                bufsize=1,
+                **_POPEN_KWARGS,
+            )
+            clip_dur = max(0.01, (self._job.end - self._job.start) * dur_multiplier)
+            assert self._proc.stdout is not None
+            for line in self._proc.stdout:
+                if self._cancelled:
+                    self._proc.terminate()
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                key, _, value = line.partition("=")
+                if key in ("out_time_us", "out_time_ms") and value.lstrip("-").isdigit():
+                    t = int(value) / 1_000_000
+                    pct = min(1.0, max(0.0, t / clip_dur))
+                    overall = phase_start + pct * phase_span
+                    self.progress.emit(int(overall))
+                    self._update_eta(overall)
+                elif key == "progress" and value == "end":
+                    self.progress.emit(phase_start + phase_span)
+                    break
+            rc = self._proc.wait()
+            if rc != 0 and not self._cancelled:
+                stderr_file.seek(0)
+                err = stderr_file.read()
+                raise RuntimeError(f"ffmpeg exited with code {rc}: {err.strip()[-300:]}")
+        finally:
+            stderr_file.close()
+            try:
+                os.unlink(stderr_file.name)
+            except OSError:
+                pass
 
     def _update_eta(self, overall_pct: float) -> None:
         if overall_pct < 2.0:
@@ -320,6 +330,4 @@ def start_conversion(job: ConvertJob) -> tuple[QThread, ConvertWorker]:
     thread.started.connect(worker.run)
     worker.finished.connect(thread.quit)
     worker.failed.connect(thread.quit)
-    thread.finished.connect(worker.deleteLater)
-    thread.finished.connect(thread.deleteLater)
     return thread, worker

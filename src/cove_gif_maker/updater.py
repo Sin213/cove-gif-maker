@@ -25,6 +25,7 @@ Usage from a MainWindow:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -194,6 +195,7 @@ class DownloadWorker(QObject):
                         written += len(chunk)
                         if total > 0:
                             self.progress.emit(int(written * 100 / total))
+            self._verify_checksum()
             self.finished.emit(str(self._dest))
         except Exception as exc:  # noqa: BLE001
             try:
@@ -201,6 +203,30 @@ class DownloadWorker(QObject):
             except Exception:  # noqa: BLE001
                 pass
             self.failed.emit(str(exc))
+
+    def _verify_checksum(self) -> None:
+        sha_url = self._url + ".sha256"
+        try:
+            req = urllib.request.Request(
+                sha_url,
+                headers={"User-Agent": f"{self._repo.split('/')[-1]}-updater"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                line = resp.read(256).decode("utf-8", errors="ignore").strip()
+        except Exception:  # noqa: BLE001
+            return
+        expected = line.split()[0].lower()
+        if len(expected) != 64:
+            return
+        sha = hashlib.sha256()
+        with open(self._dest, "rb") as f:
+            for chunk in iter(lambda: f.read(262144), b""):
+                sha.update(chunk)
+        actual = sha.hexdigest()
+        if actual != expected:
+            raise RuntimeError(
+                f"Checksum mismatch (expected {expected[:12]}… got {actual[:12]}…)"
+            )
 
 
 def swap_in_appimage(new_path: Path) -> Path:

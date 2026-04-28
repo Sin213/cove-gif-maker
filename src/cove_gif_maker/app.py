@@ -572,6 +572,7 @@ class MainWindow(QMainWindow):
         self._batch = BatchQueue()
         self._batch.changed.connect(self._on_batch_changed)
         self._batch_active_idx: int | None = None
+        self._batch_reserved_paths: set[Path] = set()
         self._tool: str = "trim"   # "trim" | "crop"
         self._active_preset: str | None = None
         self._last_progress = 0
@@ -2178,14 +2179,19 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(50, self._maybe_run_next_batch_item)
 
     def _on_conversion_failed(self, msg: str) -> None:
+        cancelled = msg == "Cancelled"
         self._pulse.set_state("idle")
-        self.status_line.set_failed(f"failed · {msg[:80]}")
+        if cancelled:
+            self.status_line.set_failed("cancelled")
+        else:
+            self.status_line.set_failed(f"failed · {msg[:80]}")
         self.progress.setVisible(False)
         if self._batch_active_idx is not None:
-            self._batch.mark(self._batch_active_idx, QueueStatus.FAILED, error=msg)
+            status = QueueStatus.SKIPPED if cancelled else QueueStatus.FAILED
+            self._batch.mark(self._batch_active_idx, status, error=msg)
             self._batch_active_idx = None
             QTimer.singleShot(50, self._maybe_run_next_batch_item)
-        else:
+        elif not cancelled:
             QMessageBox.warning(self, "Conversion failed", msg)
 
     def _reset_after_conversion(self) -> None:
@@ -2203,6 +2209,7 @@ class MainWindow(QMainWindow):
     def _maybe_run_next_batch_item(self) -> None:
         nxt = self._batch.next_pending()
         if not nxt:
+            self._batch_reserved_paths.clear()
             if not self._batch.is_empty():
                 self.status_line.set_done("Batch complete.")
             return
@@ -2213,9 +2220,10 @@ class MainWindow(QMainWindow):
         out_path = self._suggested_output_path(item.path, ext)
         base = out_path
         n = 1
-        while out_path.exists():
+        while out_path.exists() or out_path in self._batch_reserved_paths:
             n += 1
             out_path = base.with_name(f"{base.stem}-{n}{base.suffix}")
+        self._batch_reserved_paths.add(out_path)
         self._launch_job(item.path, out_path, primary=False)
 
     # -----------------------------------------------------------------

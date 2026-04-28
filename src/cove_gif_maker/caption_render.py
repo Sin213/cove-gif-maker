@@ -80,8 +80,20 @@ def render_many_to_png(captions: list[ff.Caption], video_w: int, video_h: int,
         p.setFont(f)
 
         fm = QFontMetricsF(f)
+        max_text_w = video_w * 0.9
         text_w = fm.horizontalAdvance(text)
-        text_h = fm.height()
+        if text_w > max_text_w and max_text_w > 0:
+            br = fm.boundingRect(
+                QRectF(0, 0, max_text_w, video_h * 4),
+                Qt.AlignCenter | Qt.TextWordWrap,
+                text,
+            )
+            text_w = br.width()
+            text_h = br.height()
+            wrap_flags = Qt.AlignCenter | Qt.TextWordWrap
+        else:
+            text_h = fm.height()
+            wrap_flags = Qt.AlignCenter
 
         cx = caption.pos_x * video_w
         cy = caption.pos_y * video_h
@@ -102,10 +114,10 @@ def render_many_to_png(captions: list[ff.Caption], video_w: int, video_h: int,
             for dy in (-outline_w, 0, outline_w):
                 if dx == 0 and dy == 0:
                     continue
-                p.drawText(rect.adjusted(dx, dy, dx, dy), Qt.AlignCenter, text)
+                p.drawText(rect.adjusted(dx, dy, dx, dy), wrap_flags, text)
 
         p.setPen(QColor(caption.color))
-        p.drawText(rect, Qt.AlignCenter, text)
+        p.drawText(rect, wrap_flags, text)
         p.restore()
         drew_any = True
 
