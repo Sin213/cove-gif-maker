@@ -116,6 +116,15 @@ cp "$APPDIR/$APP_NAME.desktop" "$APPDIR/usr/share/applications/$APP_NAME.desktop
 cat > "$APPDIR/AppRun" <<EOF
 #!/usr/bin/env bash
 HERE="\$(dirname "\$(readlink -f "\${0}")")"
+# Stash the host's original env vars under APPIMAGE_ORIG_* so the app
+# can restore them when spawning host tools (xdg-open, etc.). Without
+# this, child processes inherit our bundled paths and crash.
+export APPIMAGE_ORIG_PATH="\${PATH:-}"
+export APPIMAGE_ORIG_LD_LIBRARY_PATH="\${LD_LIBRARY_PATH:-}"
+export APPIMAGE_ORIG_PYTHONHOME="\${PYTHONHOME:-}"
+export APPIMAGE_ORIG_PYTHONPATH="\${PYTHONPATH:-}"
+export APPIMAGE_ORIG_QT_PLUGIN_PATH="\${QT_PLUGIN_PATH:-}"
+export APPIMAGE_ORIG_QML2_IMPORT_PATH="\${QML2_IMPORT_PATH:-}"
 export PATH="\$HERE/usr/bin:\$PATH"
 export LD_LIBRARY_PATH="\$HERE/usr/lib/$APP_NAME:\${LD_LIBRARY_PATH:-}"
 exec "\$HERE/usr/lib/$APP_NAME/$APP_NAME" "\$@"

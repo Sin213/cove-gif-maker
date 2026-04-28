@@ -42,6 +42,11 @@ class ConvertJob:
     # fills these from probe().
     source_width: int = 0
     source_height: int = 0
+    # Target-size compression: when > 0, the worker runs the conversion,
+    # checks the output vs `target_size_kb`, and if it's too big, lowers
+    # quality/palette/scale and retries up to `target_max_attempts` times.
+    target_size_kb: float = 0.0
+    target_max_attempts: int = 4
 
 
 class ConvertWorker(QObject):
@@ -69,10 +74,7 @@ class ConvertWorker(QObject):
         self._job_start_wall = time.monotonic()
         self._eta_smoothed = None
         try:
-            if job.fmt == "gif":
-                self._run_gif(job)
-            else:
-                self._run_webp(job)
+            self._run_with_target(job)
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
             return
@@ -80,6 +82,87 @@ class ConvertWorker(QObject):
             self.failed.emit("Cancelled")
             return
         self.finished.emit(job.output)
+
+    # --- target-size compression --------------------------------------
+
+    def _run_with_target(self, job: ConvertJob) -> None:
+        """Run the conversion once, then iteratively lower quality / scale
+        if the output exceeds `target_size_kb`. With no target set, runs
+        a single pass."""
+        attempts = 0
+        attempt_limit = max(1, job.target_max_attempts) if job.target_size_kb > 0 else 1
+        while True:
+            attempts += 1
+            self._reset_progress_state()
+            if attempts > 1:
+                self.log.emit(
+                    f"Compressing further (attempt {attempts}/{attempt_limit})"
+                )
+            if job.fmt == "gif":
+                self._run_gif(job)
+            else:
+                self._run_webp(job)
+            if self._cancelled or job.target_size_kb <= 0:
+                return
+            if not job.output.exists():
+                return
+            actual_kb = job.output.stat().st_size / 1024.0
+            if actual_kb <= job.target_size_kb:
+                self.log.emit(
+                    f"Hit target ({actual_kb:.0f} KB ≤ {job.target_size_kb:.0f} KB)"
+                )
+                return
+            if attempts >= attempt_limit:
+                self.log.emit(
+                    f"Stopping at {actual_kb:.0f} KB (target {job.target_size_kb:.0f} KB)"
+                )
+                return
+            # Re-tune the job for the next attempt. We're aggressive with
+            # the cut on the first retry (output is way over) and back off
+            # to gentler steps as we approach the target.
+            overshoot = actual_kb / job.target_size_kb
+            self._tighten_job(job, overshoot=overshoot)
+
+    def _reset_progress_state(self) -> None:
+        # Each attempt starts the progress bar from 0%.
+        self._eta_smoothed = None
+        self._job_start_wall = time.monotonic()
+        self.progress.emit(0)
+
+    @staticmethod
+    def _tighten_job(job: ConvertJob, *, overshoot: float) -> None:
+        """Reduce quality / palette / scale so the next attempt produces
+        a smaller file. Mutates `job` in place.
+
+        The tightening strategy depends on overshoot magnitude:
+        - WebP: lower quality first (roughly linear effect). Once quality
+          hits the floor (q=20), or for very high overshoot (>3x), drop
+          scale too — quality alone can't bridge a 5x gap, but cutting
+          resolution does.
+        - GIF: halve the palette first (big win, perceptually mild), then
+          drop scale. Scale is the killer lever once the palette is at 64.
+        """
+        if job.fmt == "webp":
+            old_q = job.webp_quality
+            cut = 0.6 if overshoot > 3.0 else (0.7 if overshoot > 2.0 else 0.85)
+            new_q = max(20, int(round(old_q * cut)))
+            job.webp_quality = new_q
+            # When quality can't drop further, OR we're far from target,
+            # also reduce scale so the next pass has a real chance.
+            quality_floored = (new_q == old_q == 20)
+            if quality_floored or (new_q <= 30 and overshoot > 1.5):
+                if job.scale_pct > 20:
+                    scale_cut = 0.8 if overshoot > 2.0 else 0.9
+                    job.scale_pct = max(20, int(round(job.scale_pct * scale_cut)))
+        else:
+            # GIF: palette → scale → fps drops, in that order of impact.
+            if job.palette_colors > 64:
+                job.palette_colors = max(64, job.palette_colors // 2)
+            elif job.scale_pct > 20:
+                cut = 0.7 if overshoot > 2.0 else 0.85
+                job.scale_pct = max(20, int(round(job.scale_pct * cut)))
+            elif job.fps > 8:
+                job.fps = max(8, job.fps - 4)
 
     # --- format-specific pipelines -------------------------------------
 

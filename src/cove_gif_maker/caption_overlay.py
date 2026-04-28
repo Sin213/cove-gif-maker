@@ -69,12 +69,24 @@ class CaptionOverlay(QWidget):
         self._resize_start_dist: float = 0.0
         self._rotate_start_angle: float = 0.0   # degrees the cursor was at
         self._rotate_start_rotation: float = 0.0  # degrees the text was at
+        # Selection state — when False the dashed border + handles +
+        # rotate bubble are hidden even on hover. Becomes True on click,
+        # False on ESC (handled by MainWindow).
+        self._selected: bool = False
         # Start fully masked-out — without a mask the empty overlay would
         # eat clicks meant for the video below.
         self._refresh_mask()
 
     def rotation_deg(self) -> float:
         return self._style.rotation_deg
+
+    def is_selected(self) -> bool:
+        return self._selected
+
+    def deselect(self) -> None:
+        if self._selected:
+            self._selected = False
+            self.update()
 
     # --- public API ---------------------------------------------------
 
@@ -294,9 +306,9 @@ class CaptionOverlay(QWidget):
 
         # Hover/drag chrome — dashed border around the rotated polygon, a
         # corner handle at each corner, and a rotation bubble above with a
-        # connector line. Always shown when active so all three affordances
-        # (move / resize / rotate) are discoverable.
-        active = self.underMouse() or self._mode
+        # connector line. Hidden while the caption is deselected (press
+        # ESC to deselect, click to re-select).
+        active = (self._selected and (self.underMouse() or self._mode))
         if not active:
             p.end()
             return
@@ -350,12 +362,16 @@ class CaptionOverlay(QWidget):
         # Priority: rotate handle > corner resize > body move. The body
         # check is polygon-based (the rotated text shape) rather than
         # rectangle-based so users can grab rotated text from anywhere
-        # within its visible bounds.
+        # within its visible bounds. Any of these hits also marks the
+        # caption as selected — chrome (handles, dashed border) only
+        # shows for selected captions and ESC clears the selection.
         if self._hit_rotate_handle(event.position()):
             self._mode = "rotate"
             self._rotate_start_angle = self._angle_to(event.position())
             self._rotate_start_rotation = self._style.rotation_deg
+            self._selected = True
             self.setCursor(Qt.CrossCursor)
+            self.update()
             event.accept()
             return
         handle = self._hit_handle(event.position())
@@ -367,7 +383,9 @@ class CaptionOverlay(QWidget):
                 _length(event.position() - self._resize_anchor),
             )
             self._resize_start_size = self._style.size_pct
+            self._selected = True
             self.setCursor(Qt.SizeFDiagCursor)
+            self.update()
             event.accept()
             return
         if not self._text_polygon().containsPoint(
@@ -375,7 +393,9 @@ class CaptionOverlay(QWidget):
             return  # let other widgets get the click
         self._mode = "move"
         self._drag_offset = event.position() - self._text_center()
+        self._selected = True
         self.setCursor(Qt.ClosedHandCursor)
+        self.update()
         event.accept()
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:

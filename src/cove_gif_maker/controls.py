@@ -116,6 +116,133 @@ class Stepper(QWidget):
 
 
 # =====================================================================
+# TargetSizeInput — KB/MB-aware stepper for the Compression tab
+# =====================================================================
+
+class TargetSizeInput(QWidget):
+    """Stepper that stores KB internally and displays "256 KB" or "10 MB"
+    based on magnitude. Adapts step size to the current value so the user
+    can dial in tight targets (Discord emoji 256 KB) AND large ones
+    (Reddit 100 MB) from the same control."""
+
+    valueChanged = Signal(int)  # KB
+
+    _MIN_KB = 64
+    _MAX_KB = 200 * 1024  # 200 MB ceiling
+
+    def __init__(self, *, value_kb: int = 10 * 1024,
+                 parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._value_kb = max(self._MIN_KB, min(self._MAX_KB, int(value_kb)))
+        self.setStyleSheet(
+            f"QFrame#cove-stepper {{ background: {theme.SURFACE};"
+            f" border: 1px solid {theme.BORDER};"
+            f" border-radius: {theme.RADIUS_XS}px;"
+            f" padding: 2px; }}"
+            f"QFrame#cove-stepper:focus-within {{ border-color: {theme.ACCENT_RING}; }}"
+        )
+        wrap = QFrame(self)
+        wrap.setObjectName("cove-stepper")
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(wrap)
+
+        layout = QHBoxLayout(wrap)
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(2)
+
+        btn_qss = (
+            f"QPushButton {{ background: transparent; color: {theme.TEXT_FAINT};"
+            f" border: none; border-radius: 4px; font-size: 14px; padding: 0; }}"
+            f"QPushButton:hover {{ background: {theme.SURFACE_3}; color: {theme.TEXT}; }}"
+        )
+        self._dec = QPushButton("−")
+        self._dec.setFixedSize(22, 22)
+        self._dec.setCursor(Qt.PointingHandCursor)
+        self._dec.setStyleSheet(btn_qss)
+        self._dec.clicked.connect(self._on_dec)
+        self._inc = QPushButton("+")
+        self._inc.setFixedSize(22, 22)
+        self._inc.setCursor(Qt.PointingHandCursor)
+        self._inc.setStyleSheet(btn_qss)
+        self._inc.clicked.connect(self._on_inc)
+        self._edit = QLineEdit()
+        self._edit.setFixedWidth(72)
+        self._edit.setAlignment(Qt.AlignCenter)
+        self._edit.setStyleSheet(
+            f"QLineEdit {{ background: transparent; color: {theme.TEXT};"
+            f" border: none; font-family: '{theme.FONT_MONO}', monospace;"
+            f" font-size: 12px; }}"
+        )
+        self._edit.editingFinished.connect(self._on_edit_done)
+
+        layout.addWidget(self._dec)
+        layout.addWidget(self._edit)
+        layout.addWidget(self._inc)
+        self._refresh_text()
+
+    # -- Public API -------------------------------------------------
+
+    def value_kb(self) -> int:
+        return self._value_kb
+
+    def set_value_kb(self, kb: int) -> None:
+        kb = max(self._MIN_KB, min(self._MAX_KB, int(kb)))
+        if kb == self._value_kb:
+            self._refresh_text()
+            return
+        self._value_kb = kb
+        self._refresh_text()
+        self.valueChanged.emit(kb)
+
+    # -- Step rules -------------------------------------------------
+
+    def _step(self) -> int:
+        """Step size adapts to the current value so tight (KB-scale)
+        targets are reachable AND large (MB-scale) targets don't take
+        forever to scroll to."""
+        v = self._value_kb
+        if v < 1024:           return 64        # 64 KB
+        if v < 10 * 1024:      return 256       # 0.25 MB
+        if v < 50 * 1024:      return 1024      # 1 MB
+        return 5 * 1024                          # 5 MB
+
+    def _on_dec(self) -> None:
+        self.set_value_kb(self._value_kb - self._step())
+
+    def _on_inc(self) -> None:
+        self.set_value_kb(self._value_kb + self._step())
+
+    # -- Text formatting --------------------------------------------
+
+    def _refresh_text(self) -> None:
+        text = self._format(self._value_kb)
+        if self._edit.text() != text:
+            self._edit.setText(text)
+
+    @staticmethod
+    def _format(kb: int) -> str:
+        if kb < 1024:
+            return f"{kb} KB"
+        mb = kb / 1024
+        return f"{mb:.0f} MB" if abs(mb - round(mb)) < 0.05 else f"{mb:.1f} MB"
+
+    def _on_edit_done(self) -> None:
+        # Accept "256", "256 KB", "10 MB", "10.5MB", "0.5 MB"
+        text = self._edit.text().strip().upper().replace(" ", "")
+        try:
+            if text.endswith("MB"):
+                kb = int(round(float(text[:-2]) * 1024))
+            elif text.endswith("KB"):
+                kb = int(round(float(text[:-2])))
+            else:
+                kb = int(round(float(text)))  # bare number → KB
+            self.set_value_kb(kb)
+        except (ValueError, TypeError):
+            self._refresh_text()
+
+
+# =====================================================================
 # Segmented control — pill of buttons, exactly one active
 # =====================================================================
 

@@ -10,7 +10,7 @@ move. Edge resizing is driven by `FramelessResizer`.
 from __future__ import annotations
 
 from PySide6.QtCore import QPoint, QRect, Qt
-from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPixmap
+from PySide6.QtGui import QColor, QGuiApplication, QMouseEvent, QPainter, QPixmap
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QSizePolicy, QWidget
 
 from . import theme
@@ -277,13 +277,27 @@ class FramelessResizer:
     """Helper for resizing a frameless QMainWindow.
 
     Owned by `MainWindow`; the window's mouse event overrides delegate to
-    `try_press` / `try_move` / `try_release`."""
+    `try_press` / `try_move` / `try_release`. Cursor feedback is handled
+    via `QGuiApplication.setOverrideCursor` (a stack) so child widgets
+    that set their own cursors always win — no more "stuck SizeVerCursor"
+    after the user moves from a window edge into a control."""
+
+    # Cached at class level so we don't allocate every move event.
+    _CURSORS = {
+        "l":  Qt.SizeHorCursor, "r":  Qt.SizeHorCursor,
+        "t":  Qt.SizeVerCursor, "b":  Qt.SizeVerCursor,
+        "tl": Qt.SizeFDiagCursor, "br": Qt.SizeFDiagCursor,
+        "tr": Qt.SizeBDiagCursor, "bl": Qt.SizeBDiagCursor,
+    }
 
     def __init__(self, window) -> None:  # noqa: ANN001
         self._w = window
         self._resizing_edge: str | None = None
         self._press_global: QPoint | None = None
         self._press_geom: QRect | None = None
+        # The current edge under the cursor (None when not on any edge).
+        # When this changes, push/pop the override cursor.
+        self._hover_edge: str | None = None
 
     def try_press(self, event) -> bool:  # noqa: ANN001
         if event.button() != Qt.LeftButton:
@@ -311,7 +325,17 @@ class FramelessResizer:
         self._resizing_edge = None
         self._press_global = None
         self._press_geom = None
+        # Drop the hover cursor — we may have left the edge during drag.
+        self.clear_hover()
         return True
+
+    def clear_hover(self) -> None:
+        """Reset edge cursor — call from leaveEvent/focus loss to avoid
+        leftover cursor when the pointer exits the window via a child
+        widget that ate the move event."""
+        if self._hover_edge is not None:
+            QGuiApplication.restoreOverrideCursor()
+            self._hover_edge = None
 
     def _edge_for(self, pos: QPoint) -> str | None:
         if self._w.isMaximized():
@@ -334,17 +358,19 @@ class FramelessResizer:
         return None
 
     def _update_cursor(self, pos: QPoint) -> None:
+        """Push/pop a single override cursor reflecting the current edge.
+
+        Override cursor is a stack — child widgets that call setCursor()
+        in their hover handlers will sit on top and win, so we never end
+        up with a stuck resize cursor over a child widget."""
         edge = self._edge_for(pos)
-        cursors = {
-            "l":  Qt.SizeHorCursor, "r":  Qt.SizeHorCursor,
-            "t":  Qt.SizeVerCursor, "b":  Qt.SizeVerCursor,
-            "tl": Qt.SizeFDiagCursor, "br": Qt.SizeFDiagCursor,
-            "tr": Qt.SizeBDiagCursor, "bl": Qt.SizeBDiagCursor,
-        }
-        if edge:
-            self._w.setCursor(cursors[edge])
-        elif self._w.cursor().shape() != Qt.ArrowCursor:
-            self._w.unsetCursor()
+        if edge == self._hover_edge:
+            return
+        if self._hover_edge is not None:
+            QGuiApplication.restoreOverrideCursor()
+        if edge is not None:
+            QGuiApplication.setOverrideCursor(self._CURSORS[edge])
+        self._hover_edge = edge
 
     def _do_resize(self, global_pos: QPoint) -> None:
         if not (self._press_global and self._press_geom and self._resizing_edge):

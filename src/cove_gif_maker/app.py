@@ -22,6 +22,7 @@ from PySide6.QtGui import (
     QDragEnterEvent,
     QDropEvent,
     QFont,
+    QGuiApplication,
     QIcon,
     QKeySequence,
     QLinearGradient,
@@ -60,7 +61,7 @@ from .caption_overlay import CaptionOverlay, CaptionStyle
 from .chrome import CoveTitleBar, FramelessResizer
 from .controls import (
     CoveSlider, EffectRow, FilePill, KV, PresetCard, RailTabs, Segmented,
-    StatusLine, Stepper,
+    StatusLine, Stepper, TargetSizeInput,
 )
 from .converter import ConvertJob, start_conversion
 from .crop_overlay import CropOverlay
@@ -426,20 +427,72 @@ class ResultChip(QFrame):
         self.cleared.emit()
 
     def _on_open_folder(self) -> None:
+        """Reveal the file in the user's file manager.
+
+        AppImage rewrites PATH / LD_LIBRARY_PATH / PYTHONHOME to point at
+        the bundled runtime, which breaks spawned tools like xdg-open
+        (they end up trying to load AppImage's Python and crash). We
+        restore the original environment via `APPIMAGE_ORIG_*` when
+        present, then strip any vars the bundled launcher injected.
+        """
         if self._path is None:
             return
         import os as _os
         import subprocess as _sp
         target = str(self._path.parent)
+        env = self._host_environ()
         try:
             if _os.name == "nt":
-                _sp.Popen(["explorer", f"/select,{self._path}"])
+                _sp.Popen(["explorer", f"/select,{self._path}"], env=env)
             elif _sys_is_macos():
-                _sp.Popen(["open", "-R", str(self._path)])
+                _sp.Popen(["open", "-R", str(self._path)], env=env)
             else:
-                _sp.Popen(["xdg-open", target])
+                # Try a few openers in order of preference. xdg-open is
+                # the standard, but some minimal desktops only ship one
+                # of the others.
+                for opener in ("xdg-open", "gio", "kde-open5", "kde-open"):
+                    if opener == "gio":
+                        cmd = ["gio", "open", target]
+                    else:
+                        cmd = [opener, target]
+                    try:
+                        _sp.Popen(cmd, env=env,
+                                  stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                        return
+                    except FileNotFoundError:
+                        continue
         except Exception:  # noqa: BLE001
             pass
+
+    @staticmethod
+    def _host_environ() -> dict:
+        """Return an env dict suitable for spawning host tools.
+
+        AppImage's AppRun sets `APPIMAGE_ORIG_<NAME>` for variables it
+        rewrites — restore from those when present, and drop any leftover
+        bundled-runtime overrides so the spawned tool uses the host's libs."""
+        import os as _os
+        env = _os.environ.copy()
+        for var in (
+            "PATH", "LD_LIBRARY_PATH", "PYTHONHOME", "PYTHONPATH",
+            "QT_PLUGIN_PATH", "QML2_IMPORT_PATH",
+            "GDK_PIXBUF_MODULE_FILE", "GDK_PIXBUF_MODULEDIR",
+            "GTK_EXE_PREFIX", "GTK_DATA_PREFIX", "XDG_DATA_DIRS",
+            "GIO_MODULE_DIR", "GSETTINGS_SCHEMA_DIR",
+            "FONTCONFIG_FILE", "FONTCONFIG_PATH",
+        ):
+            orig = env.get(f"APPIMAGE_ORIG_{var}")
+            if orig is not None:
+                env[var] = orig
+            elif env.get("APPIMAGE") and var in (
+                "LD_LIBRARY_PATH", "PYTHONHOME", "PYTHONPATH",
+                "QT_PLUGIN_PATH", "QML2_IMPORT_PATH",
+                "GDK_PIXBUF_MODULE_FILE",
+            ):
+                # Inside an AppImage but no ORIG saved — drop it so the
+                # child uses the host defaults rather than our bundled libs.
+                env.pop(var, None)
+        return env
 
 
 # =====================================================================
@@ -546,6 +599,28 @@ class MainWindow(QMainWindow):
         sc = QShortcut(QKeySequence(Qt.Key_Space), self)
         sc.setContext(Qt.WindowShortcut)
         sc.activated.connect(self._on_space_pressed)
+
+        # ESC deselects any active caption (hides chrome until next click).
+        esc = QShortcut(QKeySequence(Qt.Key_Escape), self)
+        esc.setContext(Qt.WindowShortcut)
+        esc.activated.connect(self._on_escape_pressed)
+
+        # Comma / period seek (NLE convention): bare = ±1 s, Shift = ±5 s.
+        # `<` and `>` are the shifted variants of `,` and `.` respectively,
+        # so binding both gives the convenient extra-jump behavior on US
+        # keyboards while staying friendly to layouts where Shift+`,`
+        # produces a different code.
+        for seq, delta_ms in (
+            (Qt.Key_Comma, -1000),
+            (Qt.Key_Period, +1000),
+            ("<", -5000),
+            (">", +5000),
+            ("Shift+,", -5000),
+            ("Shift+.", +5000),
+        ):
+            sh = QShortcut(QKeySequence(seq), self)
+            sh.setContext(Qt.WindowShortcut)
+            sh.activated.connect(lambda d=delta_ms: self._seek_relative(d))
 
         # Restore window geometry across launches.
         geom = prefs.window_geometry()
@@ -917,17 +992,19 @@ class MainWindow(QMainWindow):
             ("output", "Output"),
             ("effects", "Effects"),
             ("caption", "Caption"),
+            ("compress", "Compress"),
         ], active="output")
         self._tabs.activeChanged.connect(self._on_tab_changed)
         layout.addWidget(self._tabs)
 
-        # Stack of tab content (Output / Effects / Caption).
+        # Stack of tab content (Output / Effects / Caption / Compress).
         self._tab_stack = QStackedWidget()
         layout.addWidget(self._tab_stack, stretch=1)
 
         self._tab_stack.addWidget(self._build_tab_output())
         self._tab_stack.addWidget(self._build_tab_effects())
         self._tab_stack.addWidget(self._build_tab_caption())
+        self._tab_stack.addWidget(self._build_tab_compress())
 
         # Sticky footer — estimated size + Convert/Cancel + status line.
         layout.addWidget(self._build_rail_footer())
@@ -1138,6 +1215,127 @@ class MainWindow(QMainWindow):
 
         layout.addStretch(1)
         return scroll
+
+    def _build_tab_compress(self) -> QWidget:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setFrameShape(QFrame.NoFrame)
+        body = QWidget()
+        scroll.setWidget(body)
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(0, 4, 0, 110)
+        layout.setSpacing(0)
+
+        # Target-size toggle + size stepper -----------------------------
+        section, inner = self._make_section("Target size")
+
+        target_icon = QLabel("⤓")
+        target_icon.setStyleSheet("background: transparent;")
+        self.target_enabled = EffectRow(
+            icon=target_icon, title="Limit output size",
+            desc="auto-recompress until file fits",
+        )
+        self.target_enabled.toggled.connect(self._on_target_toggled)
+        inner.addWidget(self.target_enabled)
+
+        size_row = QHBoxLayout()
+        size_row.setSpacing(12)
+        lbl = QLabel("Maximum")
+        lbl.setStyleSheet(f"color: {theme.TEXT_DIM}; font-size: 12px; min-width: 70px;")
+        size_row.addWidget(lbl)
+        size_row.addStretch(1)
+        # KB-aware stepper so users can set tight targets like Discord
+        # animated emoji (256 KB) without hunting for a fractional-MB
+        # input. Internal value is always KB.
+        self.target_size_input = TargetSizeInput(value_kb=10 * 1024)
+        self.target_size_input.valueChanged.connect(
+            lambda _kb: self._on_target_size_changed()
+        )
+        size_row.addWidget(self.target_size_input)
+        inner.addLayout(size_row)
+        layout.addWidget(section)
+
+        # Platform preset cards ----------------------------------------
+        # KB-per-platform: based on each service's actual upload limit.
+        # Discord emoji + sticker are KB-scale; everything else is MB.
+        section2, inner2 = self._make_section("Platforms")
+        self._platform_cards: list[tuple[int, PresetCard]] = []
+        grid_widget = QWidget()
+        grid = QHBoxLayout(grid_widget)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(6)
+        col1 = QVBoxLayout(); col2 = QVBoxLayout()
+        col1.setSpacing(6); col2.setSpacing(6)
+        platforms = [
+            (256,        "Discord Emoji",   "≤ 256 KB"),
+            (512,        "Discord Sticker", "≤ 512 KB"),
+            (10 * 1024,  "Discord",         "≤ 10 MB"),
+            (8 * 1024,   "Slack",           "≤ 8 MB"),
+            (5 * 1024,   "Twitter / X",     "≤ 5 MB"),
+            (8 * 1024,   "Steam",           "≤ 8 MB"),
+            (100 * 1024, "Reddit",          "≤ 100 MB"),
+            (25 * 1024,  "Email",           "≤ 25 MB"),
+        ]
+        for i, (kb, name, hint) in enumerate(platforms):
+            card = PresetCard(name, hint)
+            card.clicked.connect(lambda _=False, v=kb: self._apply_platform(v))
+            self._platform_cards.append((kb, card))
+            (col1 if i % 2 == 0 else col2).addWidget(card)
+        grid.addLayout(col1, stretch=1)
+        grid.addLayout(col2, stretch=1)
+        inner2.addWidget(grid_widget)
+        layout.addWidget(section2)
+
+        # Explainer ----------------------------------------------------
+        section3, inner3 = self._make_section("How it works")
+        info = QLabel(
+            "When enabled, Cove encodes once, checks the size, and"
+            " re-encodes with progressively lower quality / palette /"
+            " scale until the file fits — up to 4 attempts. Disable to"
+            " convert with whatever settings you've picked manually."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet(
+            f"color: {theme.TEXT_FAINT}; font-size: 11px;"
+        )
+        inner3.addWidget(info)
+        layout.addWidget(section3)
+
+        layout.addStretch(1)
+        return scroll
+
+    def _on_target_toggled(self, _on: bool) -> None:
+        self._refresh_convert_button_label()
+        self._refresh_platform_highlight()
+
+    def _on_target_size_changed(self) -> None:
+        self._refresh_platform_highlight()
+        self._refresh_convert_button_label()
+
+    def _refresh_platform_highlight(self) -> None:
+        v = self.target_size_input.value_kb()
+        active_target = self.target_enabled.is_checked()
+        for ckb, card in self._platform_cards:
+            card.set_active(active_target and ckb == v)
+
+    def _apply_platform(self, kb: int) -> None:
+        """One-click platform: enable the toggle, set the KB target, and
+        highlight the matching card."""
+        self.target_enabled.set_checked(True)
+        self.target_size_input.set_value_kb(kb)
+        for ckb, card in self._platform_cards:
+            card.set_active(ckb == kb)
+        self._refresh_convert_button_label()
+
+    def _refresh_convert_button_label(self) -> None:
+        fmt = self.format_seg.active()
+        if self.target_enabled.is_checked():
+            kb = self.target_size_input.value_kb()
+            label = f"{kb} KB" if kb < 1024 else f"{kb / 1024:.0f} MB"
+            self.convert_btn.setText(f"Convert to {fmt} ≤ {label}")
+        else:
+            self.convert_btn.setText(f"Convert to {fmt}")
 
     def _caption_edit_qss(self) -> str:
         return (
@@ -1512,12 +1710,43 @@ class MainWindow(QMainWindow):
             self.play_btn.setText("‖")
 
     def _on_space_pressed(self) -> None:
-        if self.caption_edit.hasFocus():
-            self.caption_edit.insert(" ")
+        if self.caption_edit.hasFocus() or self.caption_edit_2.hasFocus():
+            # Let the user actually type a space inside the caption field.
+            focused = self.caption_edit if self.caption_edit.hasFocus() else self.caption_edit_2
+            focused.insert(" ")
             return
         if self._info is None:
             return
         self._toggle_play()
+
+    def _on_escape_pressed(self) -> None:
+        # ESC clears focus from caption fields first (so subsequent
+        # keypresses go to the seek shortcuts, not the line edit), then
+        # deselects any active caption overlay.
+        focused = QGuiApplication.focusObject()
+        if focused is self.caption_edit or focused is self.caption_edit_2:
+            (focused if hasattr(focused, "clearFocus") else self).clearFocus()
+            return
+        for ov in (self.caption_overlay, self.caption_overlay_2):
+            ov.deselect()
+
+    def _seek_relative(self, delta_ms: int) -> None:
+        """Jump the playhead by `delta_ms`. Clamped to the trim window so
+        we never scrub past Start/End — same constraint the trim handles
+        enforce."""
+        if self._info is None:
+            return
+        # Skip when typing in a text field — `,` and `.` are both common
+        # in caption text.
+        focused = QGuiApplication.focusObject()
+        if focused is self.caption_edit or focused is self.caption_edit_2:
+            return
+        cur = self.player.position()
+        start_ms = int(self.trim_bar.start() * 1000)
+        end_ms = int(self.trim_bar.end() * 1000)
+        new_pos = max(start_ms, min(end_ms, cur + delta_ms))
+        self.player.setPosition(new_pos)
+        self.trim_bar.set_playhead(new_pos / 1000.0)
 
     def _on_player_position(self, ms: int) -> None:
         if not self._info:
@@ -1575,7 +1804,7 @@ class MainWindow(QMainWindow):
     # -----------------------------------------------------------------
 
     def _on_tab_changed(self, name: str) -> None:
-        idx = {"output": 0, "effects": 1, "caption": 2}.get(name, 0)
+        idx = {"output": 0, "effects": 1, "caption": 2, "compress": 3}.get(name, 0)
         self._tab_stack.setCurrentIndex(idx)
 
     def _on_tool_changed(self, tool: str) -> None:
@@ -1631,8 +1860,8 @@ class MainWindow(QMainWindow):
         self.webp_quality.setEnabled(is_webp)
         self._quality_value_lbl.setEnabled(is_webp)
         self.palette_seg.setEnabled(fmt == "GIF")
-        # Update Convert button label.
-        self.convert_btn.setText(f"Convert to {fmt}")
+        # Update Convert button label, including any target-size suffix.
+        self._refresh_convert_button_label()
         self._on_setting_changed()
 
     # -----------------------------------------------------------------
@@ -1806,9 +2035,17 @@ class MainWindow(QMainWindow):
             lzw = 2.6
             bytes_total = frames * w * h * bits / 8.0 / lzw
         else:
+            # Animated WebP: re-tuned against a 514×540 / 12 fps / q80 /
+            # ~7 s clip that lands at 1.5 MB. That's ~0.6 bpp first frame
+            # and ~0.85 inter-frame ratio for typical motion content
+            # (music video / casual clip). The previous gentler tuning
+            # was correct for static screen recordings but under-shot
+            # by 3x on motion content, which is what most GIFs actually
+            # capture. Static / low-motion clips will now over-estimate
+            # by ~2x, but that's the safer side to err on.
             q = max(1, self.webp_quality.value()) / 100.0
-            bits_first = q * 0.25
-            inter_ratio = 0.45
+            bits_first = q * 0.75      # bits-per-pixel for the keyframe
+            inter_ratio = 0.85         # subsequent frames as fraction of first
             first = w * h * bits_first / 8.0
             bytes_total = first + (frames - 1) * first * inter_ratio
         return bytes_total / 1024.0
@@ -1859,6 +2096,10 @@ class MainWindow(QMainWindow):
             captions=self._build_captions(),
             source_width=source_w,
             source_height=source_h,
+            target_size_kb=(
+                float(self.target_size_input.value_kb())
+                if self.target_enabled.is_checked() else 0.0
+            ),
         )
 
         if not primary:
@@ -2091,6 +2332,13 @@ class MainWindow(QMainWindow):
             event.accept()
             return
         super().mouseReleaseEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: ANN001
+        # Drop the edge-resize override cursor when the pointer leaves
+        # the window — otherwise it leaks into desktop space.
+        if self._frameless_resizer is not None:
+            self._frameless_resizer.clear_hover()
+        super().leaveEvent(event)
 
     # -----------------------------------------------------------------
     # Crop
