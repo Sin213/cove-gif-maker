@@ -4,10 +4,18 @@ from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPen
 from PySide6.QtWidgets import QWidget
 
+from . import theme
+
 
 HANDLE_SIZE = 10
 HIT_PAD = 14
 MIN_NORMALIZED = 0.05
+
+_BORDER       = QColor(theme.ACCENT)
+_HANDLE_FILL  = QColor(theme.ACCENT)
+_HANDLE_EDGE  = QColor(theme.ACCENT_ON)
+_DIM          = QColor(0, 0, 0, 150)
+_THIRDS       = QColor(255, 255, 255, 80)
 
 
 class CropOverlay(QWidget):
@@ -101,16 +109,15 @@ class CropOverlay(QWidget):
         v = self._video_display_rect()
         c = self._crop_rect_widget()
 
-        dim = QColor(0, 0, 0, 150)
         if c.top() > v.top():
-            p.fillRect(QRectF(v.left(), v.top(), v.width(), c.top() - v.top()), dim)
+            p.fillRect(QRectF(v.left(), v.top(), v.width(), c.top() - v.top()), _DIM)
         if c.bottom() < v.bottom():
-            p.fillRect(QRectF(v.left(), c.bottom(), v.width(), v.bottom() - c.bottom()), dim)
-        p.fillRect(QRectF(v.left(), c.top(), c.left() - v.left(), c.height()), dim)
-        p.fillRect(QRectF(c.right(), c.top(), v.right() - c.right(), c.height()), dim)
+            p.fillRect(QRectF(v.left(), c.bottom(), v.width(), v.bottom() - c.bottom()), _DIM)
+        p.fillRect(QRectF(v.left(), c.top(), c.left() - v.left(), c.height()), _DIM)
+        p.fillRect(QRectF(c.right(), c.top(), v.right() - c.right(), c.height()), _DIM)
 
         # rule-of-thirds guides inside crop rect
-        thirds_pen = QPen(QColor(255, 255, 255, 80), 1, Qt.DashLine)
+        thirds_pen = QPen(_THIRDS, 1, Qt.DashLine)
         p.setPen(thirds_pen)
         for i in (1, 2):
             x = c.left() + c.width() * i / 3
@@ -119,15 +126,15 @@ class CropOverlay(QWidget):
             p.drawLine(QPointF(c.left(), y), QPointF(c.right(), y))
 
         # border
-        border_pen = QPen(QColor("#5fb4ff"))
+        border_pen = QPen(_BORDER)
         border_pen.setWidth(2)
         p.setPen(border_pen)
         p.setBrush(Qt.NoBrush)
         p.drawRect(c)
 
         # handles
-        p.setBrush(QColor("#5fb4ff"))
-        p.setPen(QPen(QColor("#0d1216"), 1))
+        p.setBrush(_HANDLE_FILL)
+        p.setPen(QPen(_HANDLE_EDGE, 1))
         s = HANDLE_SIZE
         for pt in self._handle_centers(c).values():
             p.drawRect(QRectF(pt.x() - s / 2, pt.y() - s / 2, s, s))

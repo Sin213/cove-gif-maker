@@ -13,21 +13,34 @@ all four artifacts via GitHub Actions.
 ![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20Linux-informational?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
 
+![Cove GIF Maker](docs/screenshot.png)
+
 ---
 
 ## Features
 
+- **Frameless window** — custom title bar with Windows-style controls, centered
+  title, and full-bleed chrome. Cove design palette + tokens throughout.
 - **Drop or click to load** any video — MP4, MKV, WebM, MOV, AVI, M4V, MPG, WMV.
-- **Embedded preview** — play / pause by clicking the video.
+- **Embedded preview** — click to play / pause, spacebar shortcut.
 - **Visual trim bar** — thumbnail strip with draggable Start / End handles and
   a scrubbable playhead.
 - **GUI crop tool** — toggle Crop, drag a rectangle directly on the preview.
   Rule-of-thirds guides, 8 resize handles, dimmed mask outside the selection.
+- **Caption overlay** — add up to 2 text captions per export with drag-to-move,
+  corner-resize, and rotate handle on the preview. Rendered as PNG overlays
+  (works around static ffmpeg's missing drawtext filter).
+- **Right-rail layout** — Output, Effects, and Caption tabs replace the old
+  single settings column. Custom Stepper, Segmented, EffectRow, PresetCard,
+  and CoveSlider widgets.
 - **Real-time progress + ETA** — parsed from ffmpeg's progress stream.
-- **GIF or WebP output**, with FPS (8/12/15/24), scale (25/50/75/100 %),
-  palette (64–256 colors), speed (0.5x–2x), and loop count controls.
+- **GIF or WebP output** (WebP is now the default), with FPS (8/12/15/24),
+  scale (25/50/75/100 %), palette (64–256 colors), speed (0.5x–2x), and
+  loop count controls.
 - **Two-pass palette generation** for clean colors at small file sizes; a
   `gifsicle` post-pass shaves another 10–30 % when available.
+- **Open output folder** — one-click button opens the output directory in your
+  file manager (xdg-open / Explorer / Finder).
 
 ---
 
@@ -54,14 +67,19 @@ GIF-optimization pass; otherwise the app just skips that step.
 
 ## Usage
 
+![Demo](docs/demo.gif)
+
 1. Drop a video anywhere in the window (or click the empty area to browse).
 2. Drag the blue Start / End handles on the trim bar — or use the **Start** /
    **End** buttons to set them at the playhead.
 3. Click **Crop** to toggle the crop overlay; drag corners / edges to size,
    drag inside to move, **Reset** clears it.
-4. Pick FPS, scale, palette size, speed, loop count, and format on the right.
-5. Click **Convert** and choose where to save. Progress + ETA appears in the
-   bottom bar.
+4. Switch to the **Caption** tab to add text overlays — drag to position,
+   corner handles to resize, rotation handle to angle. Up to 2 per export.
+5. Pick FPS, scale, palette size, speed, loop count, and format in the
+   **Output** tab on the right rail.
+6. Click **Convert** and choose where to save. Progress + ETA appears in the
+   bottom bar. Use **Open Folder** to jump to the output directory.
 
 Drop a different video at any time — even on top of the playing preview — to
 start over.
@@ -126,13 +144,11 @@ download ffmpeg automatically.
 ### Linux — AppImage + .deb
 
 ```bash
-bash scripts/build-release.sh
+VERSION=2.0.0 bash scripts/build-release.sh
 # Output in release/:
-#   Cove-GIF-Maker-1.0.0-x86_64.AppImage
-#   cove-gif-maker_1.0.0_amd64.deb
+#   Cove-GIF-Maker-2.0.0-x86_64.AppImage
+#   cove-gif-maker_2.0.0_amd64.deb
 ```
-
-Override the version with `VERSION=1.2.0 bash scripts/build-release.sh`.
 
 ### Windows — Setup.exe + Portable.exe
 
@@ -141,15 +157,26 @@ GitHub Actions' `windows-latest`). The Windows build also bundles
 `gifsicle.exe`.
 
 ```powershell
-.\build.ps1 -Version 1.0.0
+.\build.ps1 -Version 2.0.0
 # Output in release\:
-#   cove-gif-maker-1.0.0-Setup.exe
-#   cove-gif-maker-1.0.0-Portable.exe
+#   Cove-GIF-Maker-2.0.0-Setup.exe
+#   Cove-GIF-Maker-2.0.0-Portable.exe
+```
+
+### Wine cross-compile (Windows builds on Linux)
+
+Requires Docker with `tobix/pywine:3.12` and `amake/innosetup`.
+
+```bash
+bash .winebuild/build-windows.sh
+# Output in release/:
+#   Cove-GIF-Maker-2.0.0-Setup.exe
+#   Cove-GIF-Maker-2.0.0-Portable.exe
 ```
 
 ### Automated release via GitHub Actions
 
-Push a tag matching `v*` (e.g. `v1.0.0`) and `.github/workflows/release.yml`
+Push a tag matching `v*` (e.g. `v2.0.0`) and `.github/workflows/release.yml`
 runs the Linux + Windows jobs in parallel and attaches all four artifacts to
 the GitHub Release created for the tag.
 
@@ -159,14 +186,22 @@ the GitHub Release created for the tag.
 
 ```
 src/cove_gif_maker/
-├── __main__.py        entry point
-├── app.py             main window, wiring, event filters
-├── timeline.py        custom trim-bar widget (thumbnails + handles)
-├── crop_overlay.py    draggable crop rect with rule-of-thirds guides
-├── thumbnails.py      QThread worker for ffmpeg frame extraction
-├── converter.py       QThread worker for the GIF / WebP pipeline
-├── ffmpeg_utils.py    ffprobe wrapper + ffmpeg command builders, cross-
-│                      platform binary resolution (PATH or bundled)
+├── __main__.py          entry point
+├── app.py               main window, wiring, event filters
+├── chrome.py            frameless window chrome + title bar
+├── controls.py          Stepper, Segmented, EffectRow, PresetCard, CoveSlider
+├── theme.py             Cove palette, design tokens, stylesheet
+├── timeline.py          custom trim-bar widget (thumbnails + handles)
+├── crop_overlay.py      draggable crop rect with rule-of-thirds guides
+├── caption_overlay.py   drag/resize/rotate caption handles on the preview
+├── caption_render.py    PNG overlay rendering for caption text
+├── batch.py             batch export support
+├── prefs.py             persistent user preferences
+├── thumbnails.py        QThread worker for ffmpeg frame extraction
+├── converter.py         QThread worker for the GIF / WebP pipeline
+├── ffmpeg_utils.py      ffprobe wrapper + ffmpeg command builders, cross-
+│                        platform binary resolution (PATH or bundled)
+├── updater.py           GitHub release version checker
 └── assets/cove_icon.png
 
 packaging/
@@ -176,6 +211,7 @@ packaging/
 
 build.ps1                   Windows Setup.exe + Portable.exe builder
 scripts/build-release.sh    Linux AppImage + .deb builder
+.winebuild/                 Wine cross-compile for Windows builds on Linux
 .github/workflows/          Cross-platform release CI
 ```
 
