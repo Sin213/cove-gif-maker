@@ -203,6 +203,20 @@ $portableDest = Join-Path $ReleaseDir ("{0}-{1}-Portable.exe" -f $App, $Version)
 if (Test-Path $portableDest) { Remove-Item -Force $portableDest }
 Copy-Item $portableSrc $portableDest -Force
 
+# Emit a sha256 sidecar for every release artifact — Cove Nexus checksum
+# verification (Issue #3) requires `<asset>.sha256` next to every binary.
+function Write-Sha256Sidecar([string]$file) {
+    $hash = (Get-FileHash -Algorithm SHA256 -Path $file).Hash.ToLower()
+    $name = [IO.Path]::GetFileName($file)
+    "$hash  $name" | Set-Content -Path "$file.sha256" -NoNewline -Encoding ascii
+}
+
+Step "Writing sha256 sidecars"
+Get-ChildItem -Path $ReleaseDir -Filter "*$Version*.exe" | ForEach-Object {
+    Write-Sha256Sidecar $_.FullName
+    Write-Host ("  -> {0}.sha256" -f $_.Name)
+}
+
 # --- 8. Cleanup ---------------------------------------------------------------
 
 Step "[8/8] Cleaning up"

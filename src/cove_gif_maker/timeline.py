@@ -2,13 +2,26 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from PySide6.QtCore import QPoint, QRect, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPen, QPixmap
+from PySide6.QtCore import QPoint, QRect, QRectF, QSize, Qt, Signal
+from PySide6.QtGui import (
+    QColor, QFont, QImage, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap,
+)
 from PySide6.QtWidgets import QWidget
+
+from . import theme
 
 
 HANDLE_W = 10
 TRACK_PAD = HANDLE_W // 2
+
+# Cove-themed colors for the trim bar.
+_BG          = QColor(theme.SURFACE)        # outer background of the widget
+_TRACK_BG    = QColor(theme.BG)             # behind thumbnails (sits at panel bottom)
+_DIM         = QColor(0, 0, 0, 140)         # mask outside selection
+_SELECT      = QColor(theme.ACCENT)         # selection border + handles
+_HANDLE_NOTCH = QColor(theme.ACCENT_ON)     # tiny notch in middle of handle
+_PLAYHEAD    = QColor(theme.TEXT)
+_LABEL       = QColor(theme.TEXT_DIM)
 
 
 @dataclass
@@ -92,56 +105,89 @@ class TrimBar(QWidget):
 
     def paintEvent(self, _event) -> None:  # noqa: ANN001
         p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing, False)
-        p.fillRect(self.rect(), QColor("#1f2024"))
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.fillRect(self.rect(), _BG)
 
         track = self._track_rect()
-        p.fillRect(track, QColor("#101115"))
+        # Round the thumbnail strip corners so it reads as a contained
+        # element instead of a hard rectangle bleeding into the panel.
+        radius = 6
+        track_path = QPainterPath()
+        track_path.addRoundedRect(QRectF(track), radius, radius)
+        p.setClipPath(track_path)
+        p.fillRect(track, _TRACK_BG)
 
         if self._thumbs and self._duration > 0:
             n = len(self._thumbs)
             slice_w = track.width() / n
             for i, thumb in enumerate(self._thumbs):
+                # Use floats then round to avoid 1-px gaps between tiles.
+                left = track.left() + i * slice_w
+                right = track.left() + (i + 1) * slice_w
                 target = QRect(
-                    int(track.left() + i * slice_w),
-                    track.top(),
-                    int(slice_w) + 1,
-                    track.height(),
+                    int(round(left)), track.top(),
+                    int(round(right)) - int(round(left)), track.height(),
                 )
-                scaled = thumb.scaledToHeight(track.height(), Qt.SmoothTransformation)
+                if target.width() <= 0:
+                    continue
+                # Scale by EXPANDING the smaller dimension to fill, then
+                # center-crop. With fewer slices this keeps more of each
+                # frame visible than the previous height-only scale.
+                scaled = thumb.scaled(
+                    target.size(), Qt.KeepAspectRatioByExpanding,
+                    Qt.SmoothTransformation,
+                )
                 src_x = max(0, (scaled.width() - target.width()) // 2)
+                src_y = max(0, (scaled.height() - target.height()) // 2)
                 p.drawPixmap(
-                    target,
-                    scaled,
-                    QRect(src_x, 0, min(target.width(), scaled.width()), scaled.height()),
+                    target, scaled,
+                    QRect(src_x, src_y, target.width(), target.height()),
                 )
+
+            # Subtle vertical separators between thumbnails so the strip
+            # reads as discrete frames rather than one mushy ribbon.
+            sep = QPen(QColor(0, 0, 0, 70))
+            sep.setWidth(1)
+            p.setPen(sep)
+            for i in range(1, n):
+                x = int(round(track.left() + i * slice_w))
+                p.drawLine(x, track.top(), x, track.bottom())
+
+        p.setClipping(False)
 
         # dim outside selection
         if self._duration > 0:
             sx = self._time_to_x(self._start)
             ex = self._time_to_x(self._end)
-            dim = QColor(0, 0, 0, 140)
-            p.fillRect(QRect(track.left(), track.top(), sx - track.left(), track.height()), dim)
-            p.fillRect(QRect(ex, track.top(), track.right() - ex + 1, track.height()), dim)
+            p.setClipPath(track_path)
+            p.fillRect(QRect(track.left(), track.top(), sx - track.left(), track.height()), _DIM)
+            p.fillRect(QRect(ex, track.top(), track.right() - ex + 1, track.height()), _DIM)
+            p.setClipping(False)
 
-            # selection border
-            sel_pen = QPen(QColor("#5fb4ff"))
+            # selection border (rounded to match the strip)
+            sel_pen = QPen(_SELECT)
             sel_pen.setWidth(2)
             p.setPen(sel_pen)
-            p.drawRect(QRect(sx, track.top(), max(1, ex - sx), track.height() - 1))
+            p.setBrush(Qt.NoBrush)
+            sel_rect = QRectF(sx, track.top(), max(1, ex - sx), track.height() - 1)
+            p.drawRoundedRect(sel_rect, 3, 3)
 
             # handles
-            self._draw_handle(p, sx, track, color="#5fb4ff", left=True)
-            self._draw_handle(p, ex, track, color="#5fb4ff", left=False)
+            self._draw_handle(p, sx, track)
+            self._draw_handle(p, ex, track)
 
-            # playhead
+            # playhead — soft glow trail behind a crisp white line
             ph = self._time_to_x(self._playhead)
-            p.setPen(QPen(QColor("#ffffff"), 1))
+            glow_pen = QPen(QColor(80, 230, 207, 110))
+            glow_pen.setWidth(3)
+            p.setPen(glow_pen)
+            p.drawLine(ph, track.top(), ph, track.bottom())
+            p.setPen(QPen(_PLAYHEAD, 1))
             p.drawLine(ph, track.top(), ph, track.bottom())
 
-            # time labels
-            p.setPen(QColor("#cfd0d4"))
-            f = p.font()
+            # time labels — Geist Mono so timecodes line up
+            p.setPen(_LABEL)
+            f = QFont(theme.FONT_MONO)
             f.setPointSize(8)
             p.setFont(f)
             label_y = track.bottom() + 14
@@ -152,10 +198,10 @@ class TrimBar(QWidget):
 
         p.end()
 
-    def _draw_handle(self, p: QPainter, x: int, track: QRect, color: str, left: bool) -> None:
+    def _draw_handle(self, p: QPainter, x: int, track: QRect) -> None:
         rect = QRect(x - HANDLE_W // 2, track.top() - 2, HANDLE_W, track.height() + 4)
-        p.fillRect(rect, QColor(color))
-        p.setPen(QPen(QColor("#0d1216"), 1))
+        p.fillRect(rect, _SELECT)
+        p.setPen(QPen(_HANDLE_NOTCH, 1))
         notch_x = rect.center().x()
         p.drawLine(notch_x, rect.top() + 4, notch_x, rect.bottom() - 4)
 

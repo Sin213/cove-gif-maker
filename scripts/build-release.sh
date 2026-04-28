@@ -116,6 +116,15 @@ cp "$APPDIR/$APP_NAME.desktop" "$APPDIR/usr/share/applications/$APP_NAME.desktop
 cat > "$APPDIR/AppRun" <<EOF
 #!/usr/bin/env bash
 HERE="\$(dirname "\$(readlink -f "\${0}")")"
+# Stash the host's original env vars under APPIMAGE_ORIG_* so the app
+# can restore them when spawning host tools (xdg-open, etc.). Without
+# this, child processes inherit our bundled paths and crash.
+export APPIMAGE_ORIG_PATH="\${PATH:-}"
+export APPIMAGE_ORIG_LD_LIBRARY_PATH="\${LD_LIBRARY_PATH:-}"
+export APPIMAGE_ORIG_PYTHONHOME="\${PYTHONHOME:-}"
+export APPIMAGE_ORIG_PYTHONPATH="\${PYTHONPATH:-}"
+export APPIMAGE_ORIG_QT_PLUGIN_PATH="\${QT_PLUGIN_PATH:-}"
+export APPIMAGE_ORIG_QML2_IMPORT_PATH="\${QML2_IMPORT_PATH:-}"
 export PATH="\$HERE/usr/bin:\$PATH"
 export LD_LIBRARY_PATH="\$HERE/usr/lib/$APP_NAME:\${LD_LIBRARY_PATH:-}"
 exec "\$HERE/usr/lib/$APP_NAME/$APP_NAME" "\$@"
@@ -144,11 +153,21 @@ echo "==> Building AppImage"
 APPIMAGE_OUT="$RELEASE_DIR/${DISPLAY_NAME// /-}-${VERSION}-${ARCH}.AppImage"
 ARCH=$ARCH "$APPIMAGETOOL" --no-appstream "$APPDIR" "$APPIMAGE_OUT"
 chmod +x "$APPIMAGE_OUT"
+( cd "$RELEASE_DIR" && sha256sum "$(basename "$APPIMAGE_OUT")" > "$(basename "$APPIMAGE_OUT").sha256" )
 echo "    -> $APPIMAGE_OUT"
+echo "    -> $APPIMAGE_OUT.sha256"
 
 # ----------------------------------------------------------------------
 # 4. .deb (manual: ar + tar.xz, no dpkg-deb dependency)
+#    Skip with SKIP_DEB=1 — useful when only the AppImage is needed.
 # ----------------------------------------------------------------------
+if [ "${SKIP_DEB:-0}" = "1" ]; then
+    echo "==> Skipping .deb (SKIP_DEB=1)"
+    echo ""
+    echo "Release artifacts in $RELEASE_DIR:"
+    ls -lh "$RELEASE_DIR"
+    exit 0
+fi
 echo "==> Assembling .deb tree"
 PKG_ROOT="$DEB_BUILD/${APP_NAME}_${VERSION}_${DEB_ARCH}"
 rm -rf "$DEB_BUILD"
@@ -218,8 +237,10 @@ echo -n "2.0" > "$WORK/debian-binary"
 echo "" >> "$WORK/debian-binary"
 
 (cd "$WORK" && ar -rc "$DEB_OUT" debian-binary control.tar.xz data.tar.xz)
+( cd "$RELEASE_DIR" && sha256sum "$(basename "$DEB_OUT")" > "$(basename "$DEB_OUT").sha256" )
 
 echo "    -> $DEB_OUT"
+echo "    -> $DEB_OUT.sha256"
 
 echo ""
 echo "Release artifacts in $RELEASE_DIR:"

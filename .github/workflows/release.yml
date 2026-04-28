@@ -58,14 +58,18 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: linux-appimage
-          path: release/*.AppImage
+          path: |
+            release/*.AppImage
+            release/*.AppImage.sha256
           if-no-files-found: error
 
       - name: Upload .deb
         uses: actions/upload-artifact@v4
         with:
           name: linux-deb
-          path: release/*.deb
+          path: |
+            release/*.deb
+            release/*.deb.sha256
           if-no-files-found: error
 
       - name: Attach to GitHub Release
@@ -74,7 +78,9 @@ jobs:
         with:
           files: |
             release/*.AppImage
+            release/*.AppImage.sha256
             release/*.deb
+            release/*.deb.sha256
           fail_on_unmatched_files: true
           generate_release_notes: true
 
@@ -99,14 +105,18 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: windows-setup
-          path: release/*-Setup.exe
+          path: |
+            release/*-Setup.exe
+            release/*-Setup.exe.sha256
           if-no-files-found: error
 
       - name: Upload Portable exe
         uses: actions/upload-artifact@v4
         with:
           name: windows-portable
-          path: release/*-Portable.exe
+          path: |
+            release/*-Portable.exe
+            release/*-Portable.exe.sha256
           if-no-files-found: error
 
       - name: Attach to GitHub Release
@@ -115,6 +125,8 @@ jobs:
         with:
           files: |
             release/*-Setup.exe
+            release/*-Setup.exe.sha256
             release/*-Portable.exe
+            release/*-Portable.exe.sha256
           fail_on_unmatched_files: true
           generate_release_notes: true
