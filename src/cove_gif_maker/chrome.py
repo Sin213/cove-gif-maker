@@ -21,21 +21,32 @@ _RESIZE_MARGIN = 6
 _BTN_W = 46
 
 
+_HIDPI_PIXMAP_CACHE: dict[tuple[str, int, float], QPixmap] = {}
+
+
 def _hidpi_pixmap(path: str, size: int, widget: QWidget) -> QPixmap:
     """Load a pixmap rendered at the screen's actual pixel density.
 
     `QPixmap(path).scaled(14, 14, …)` at a 2× display throws away half the
     detail. By rendering at `size * dpr` and tagging the pixmap with the
     device pixel ratio, Qt downsamples once at the right size and the
-    icon stays sharp."""
+    icon stays sharp.
+
+    Results are cached by (path, size, dpr) so repeated calls — e.g. on
+    showEvent re-renders — do not re-scale the source image."""
     dpr = float(widget.devicePixelRatioF()) if widget is not None else 1.0
     if dpr <= 0:
         dpr = 1.0
+    key = (path, size, dpr)
+    cached = _HIDPI_PIXMAP_CACHE.get(key)
+    if cached is not None:
+        return cached
     actual = max(1, int(round(size * dpr)))
     pix = QPixmap(path).scaled(
         actual, actual, Qt.KeepAspectRatio, Qt.SmoothTransformation,
     )
     pix.setDevicePixelRatio(dpr)
+    _HIDPI_PIXMAP_CACHE[key] = pix
     return pix
 
 

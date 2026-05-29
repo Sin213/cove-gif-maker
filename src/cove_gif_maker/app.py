@@ -55,7 +55,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import __version__, ffmpeg_utils as ff, prefs, theme, updater
+from . import __version__, ffmpeg_utils as ff, prefs, theme
 from .batch import BatchQueue, BatchQueuePanel, QueueStatus
 from .caption_overlay import CaptionOverlay, CaptionStyle
 from .chrome import CoveTitleBar, FramelessResizer
@@ -96,16 +96,27 @@ def _sys_is_macos() -> bool:
     return _sys.platform == "darwin"
 
 
+_HIDPI_PIXMAP_CACHE: dict[tuple[str, int, float], QPixmap] = {}
+
+
 def _hidpi_pixmap(path: str, size: int, widget=None) -> QPixmap:
-    """Load a pixmap at the screen's actual pixel density."""
+    """Load a pixmap at the screen's actual pixel density.
+
+    Results are cached by (path, size, dpr) so repeated calls — e.g. on
+    every repaint — do not re-scale the source image."""
     dpr = float(widget.devicePixelRatioF()) if widget is not None else 1.0
     if dpr <= 0:
         dpr = 1.0
+    key = (path, size, dpr)
+    cached = _HIDPI_PIXMAP_CACHE.get(key)
+    if cached is not None:
+        return cached
     actual = max(1, int(round(size * dpr)))
     pix = QPixmap(path).scaled(
         actual, actual, Qt.KeepAspectRatio, Qt.SmoothTransformation,
     )
     pix.setDevicePixelRatio(dpr)
+    _HIDPI_PIXMAP_CACHE[key] = pix
     return pix
 
 
@@ -550,6 +561,28 @@ class RecentRow(QWidget):
 
 
 # =====================================================================
+# Background ffprobe worker
+# =====================================================================
+
+class _ProbeWorker(QThread):
+    """Run ff.probe() on a background thread and deliver the result via signals."""
+
+    probeFinished = Signal(object, object)  # (path: Path, info)
+    probeFailed = Signal(object, str)       # (path: Path, error_message)
+
+    def __init__(self, path: "Path", parent=None) -> None:
+        super().__init__(parent)
+        self._path = path
+
+    def run(self) -> None:
+        try:
+            info = ff.probe(self._path)
+            self.probeFinished.emit(self._path, info)
+        except Exception as exc:  # noqa: BLE001
+            self.probeFailed.emit(self._path, str(exc))
+
+
+# =====================================================================
 # Main window
 # =====================================================================
 
@@ -564,6 +597,7 @@ class MainWindow(QMainWindow):
 
         self._video_path: Path | None = None
         self._info: ff.VideoInfo | None = None
+        self._probe_thread: _ProbeWorker | None = None
         self._thumbs_thread: QThread | None = None
         self._thumbs_worker = None
         self._convert_thread: QThread | None = None
@@ -628,7 +662,17 @@ class MainWindow(QMainWindow):
         if geom:
             self.restoreGeometry(geom)
 
-        self._updater = updater.UpdateController(
+        self._updater = None
+        # Defer the updater import until after the window is visible so the
+        # module-level network / filesystem work inside updater.py does not
+        # block the UI during startup.
+        QTimer.singleShot(0, self._init_updater)
+
+    # -----------------------------------------------------------------
+    def _init_updater(self) -> None:
+        """Import and start the update controller after the window is shown."""
+        from . import updater as _updater_mod  # noqa: PLC0415
+        self._updater = _updater_mod.UpdateController(
             parent=self,
             current_version=__version__,
             repo="Sin213/cove-gif-maker",
@@ -1631,15 +1675,28 @@ class MainWindow(QMainWindow):
         self._refresh_size_estimate()
 
     def _load_video(self, path: Path) -> None:
-        try:
-            info = ff.probe(path)
-        except ff.FFmpegMissingError as exc:
-            QMessageBox.critical(self, "Missing dependency", str(exc))
-            return
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "Could not open video", str(exc))
-            return
+        # Cancel any in-flight probe for a previous file.
+        if self._probe_thread is not None:
+            self._probe_thread.probeFinished.disconnect()
+            self._probe_thread.probeFailed.disconnect()
+            # Don't try to terminate — let it finish in the background.
+            self._probe_thread = None
 
+        worker = _ProbeWorker(path, parent=self)
+        worker.probeFinished.connect(self._on_probe_finished, Qt.QueuedConnection)
+        worker.probeFailed.connect(self._on_probe_failed, Qt.QueuedConnection)
+        self._probe_thread = worker
+        worker.start()
+
+    def _on_probe_failed(self, _path: Path, message: str) -> None:
+        self._probe_thread = None
+        if "ffmpeg" in message.lower() or "ffprobe" in message.lower():
+            QMessageBox.critical(self, "Missing dependency", message)
+        else:
+            QMessageBox.critical(self, "Could not open video", message)
+
+    def _on_probe_finished(self, path: Path, info: "ff.VideoInfo") -> None:
+        self._probe_thread = None
         self._video_path = path
         self._info = info
         self.placeholder.hide()
