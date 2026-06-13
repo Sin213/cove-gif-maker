@@ -8,10 +8,13 @@ default preset, default output directory, recent files, frameless toggle.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Iterable
 
 from PySide6.QtCore import QSettings
+
+from .portable import is_portable, portable_data_dir
 
 
 # Sentinel for "no value stored yet" — distinguishes from explicit empty string.
@@ -34,6 +37,9 @@ RECENT_LIMIT    = 8
 
 
 def _qs() -> QSettings:
+    if is_portable():
+        _portable_dir = portable_data_dir("cove-gif-maker")
+        return QSettings(os.path.join(_portable_dir, "settings.ini"), QSettings.IniFormat)
     return QSettings("Cove", "GifMaker")
 
 
