@@ -84,6 +84,14 @@ PRESETS: dict[str, dict] = {
     # by every modern client (Discord/Reddit/Slack/etc.).
     "Discord":     {"fps": 12, "scale": 50, "palette": 128, "fmt": "WebP", "webp_q": 80,
                     "hint": "≤10 MB · 12 fps"},
+    # Discord's animated-emoji slot is the one place WebP does NOT work —
+    # the emoji uploader only takes GIF/PNG — and it enforces a hard 256 KB
+    # cap on a 128x128 image. `max_px` resolves to a scale % against
+    # whatever the loaded clip's dimensions are, and `transparent` turns on
+    # the color key so an MP4-sourced emote keeps its cutout background.
+    "Discord Emote": {"fps": 15, "palette": 128, "fmt": "GIF", "webp_q": 80,
+                      "scale": 25, "max_px": 128, "transparent": True,
+                      "target_kb": 256, "hint": "128px · alpha · GIF"},
     "Reddit / X":  {"fps": 15, "scale": 75, "palette": 192, "fmt": "WebP", "webp_q": 85,
                     "hint": "15 fps · HQ"},
     "Email (tiny)":{"fps":  8, "scale": 25, "palette":  64, "fmt": "GIF",  "webp_q": 70,
@@ -612,6 +620,14 @@ class MainWindow(QMainWindow):
         self._active_preset: str | None = None
         self._last_progress = 0
         self._last_eta: float | None = None
+        # Transparency / color-key state.
+        self._key_detect_thread = None
+        self._key_guess = None            # keying.KeyGuess | None
+        self._key_detect_hint = ""        # shown when the effect is off
+        self._eyedropper = False
+        # True once the user picks a key color by hand — auto-detect then
+        # stops overwriting their choice for the current clip.
+        self._key_color_user_set = False
 
         # Frameless window with custom titlebar (cove design).
         self.setWindowFlags(self.windowFlags() | Qt.FramelessWindowHint)
@@ -1195,8 +1211,105 @@ class MainWindow(QMainWindow):
         inner.addWidget(self.reverse_row)
         layout.addWidget(section)
 
+        layout.addWidget(self._build_transparency_section())
+
         layout.addStretch(1)
         return scroll
+
+    def _build_transparency_section(self) -> QWidget:
+        """Color-key controls — the 'make this emote's background see-through'
+        section. Auto-detect runs on load, so in the common case the user only
+        has to flip the toggle."""
+        section, inner = self._make_section_with_actions(
+            "Transparency",
+            actions=[("Auto-detect", self._on_autodetect_key_clicked, "autodetect")],
+        )
+
+        alpha_icon = QLabel("▨")
+        alpha_icon.setStyleSheet("background: transparent;")
+        self.transparent_row = EffectRow(
+            icon=alpha_icon, title="Transparent background",
+            desc="key out a flat backdrop",
+        )
+        self.transparent_row.toggled.connect(self._on_transparency_toggled)
+        inner.addWidget(self.transparent_row)
+
+        # Key color + eyedropper.
+        key_row = QHBoxLayout()
+        key_row.setSpacing(6)
+        self.key_color_btn = ColorButton(ff.TENOR_BACKDROP, "Key color")
+        self.key_color_btn.colorChanged.connect(lambda _c: self._on_setting_changed())
+        key_row.addWidget(self.key_color_btn, stretch=1)
+        self.key_pick_btn = QPushButton("Pick")
+        self.key_pick_btn.setCheckable(True)
+        self.key_pick_btn.setCursor(Qt.PointingHandCursor)
+        self.key_pick_btn.setMinimumHeight(38)
+        self.key_pick_btn.setFixedWidth(56)
+        self.key_pick_btn.setToolTip("Click a pixel in the preview to use it as the key color")
+        self.key_pick_btn.toggled.connect(self._on_eyedropper_toggled)
+        key_row.addWidget(self.key_pick_btn)
+        inner.addLayout(key_row)
+
+        # Tolerance — how far from the key color still counts as background.
+        self.key_similarity = CoveSlider(minimum=1, maximum=40, value=10)
+        self.key_similarity.valueChanged.connect(lambda _v: self._on_key_tolerance_changed())
+        self._key_similarity_lbl = QLabel("10%")
+        self._key_similarity_lbl.setStyleSheet(
+            f"color: {theme.TEXT_DIM}; min-width: 36px;"
+            f" font-family: '{theme.FONT_MONO}', monospace; font-size: 11px;"
+        )
+        self._key_similarity_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        inner.addLayout(self._row(
+            "Tolerance", self.key_similarity, self._key_similarity_lbl, fill=True,
+        ))
+
+        # Edge blend — feathers the alpha ramp at the cutout boundary.
+        self.key_blend = CoveSlider(minimum=0, maximum=30, value=8)
+        self.key_blend.valueChanged.connect(lambda _v: self._on_key_blend_changed())
+        self._key_blend_lbl = QLabel("8%")
+        self._key_blend_lbl.setStyleSheet(
+            f"color: {theme.TEXT_DIM}; min-width: 36px;"
+            f" font-family: '{theme.FONT_MONO}', monospace; font-size: 11px;"
+        )
+        self._key_blend_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        inner.addLayout(self._row(
+            "Edge blend", self.key_blend, self._key_blend_lbl, fill=True,
+        ))
+
+        self._key_hint = QLabel("")
+        self._key_hint.setWordWrap(True)
+        self._key_hint.setStyleSheet(
+            f"color: {theme.TEXT_FAINT}; font-size: 10.5px;"
+            f" font-family: '{theme.FONT_MONO}', monospace; background: transparent;"
+        )
+        inner.addWidget(self._key_hint)
+
+        self._sync_transparency_controls()
+        return section
+
+    def _sync_transparency_controls(self) -> None:
+        """Grey out the key controls when the effect is off, and keep the
+        hint line describing the current state."""
+        on = self.transparent_row.is_checked()
+        loaded = self._info is not None
+        for w in (
+            self.key_color_btn, self.key_pick_btn,
+            self.key_similarity, self._key_similarity_lbl,
+            self.key_blend, self._key_blend_lbl,
+        ):
+            w.setEnabled(on and loaded)
+        if on and self.format_seg.active() == "WebP":
+            self._key_hint.setText(
+                "WebP keeps soft alpha edges, but Discord's emoji uploader "
+                "only takes GIF — switch format for emotes."
+            )
+        elif on:
+            self._key_hint.setText(
+                "GIF alpha is on/off per pixel — raise Edge blend for a "
+                "softer cut, Tolerance if backdrop specks survive."
+            )
+        else:
+            self._key_hint.setText(self._key_detect_hint)
 
     def _build_tab_caption(self) -> QWidget:
         scroll = QScrollArea()
@@ -1747,6 +1860,17 @@ class MainWindow(QMainWindow):
             f"{info.duration:.2f}s"
         )
         self._kick_off_thumbs(path, info.duration)
+        # A new clip means a new backdrop — drop the previous guess and any
+        # hand-picked key color, then look again.
+        self._key_guess = None
+        self._key_color_user_set = False
+        self._key_detect_hint = "Detecting backdrop…"
+        self._key_hint.setText(self._key_detect_hint)
+        self._start_key_detection(path)
+        # A size-capped preset (Discord Emote) resolves its scale % against
+        # the source dimensions, which only just became known.
+        if self._active_preset and "max_px" in PRESETS.get(self._active_preset, {}):
+            self._apply_preset(self._active_preset)
         self._update_controls_enabled()
         self._refresh_size_estimate()
         prefs.push_recent(path)
@@ -1896,16 +2020,42 @@ class MainWindow(QMainWindow):
         self._suppress_preset_reset = True
         try:
             self.fps_stepper.set_value(cfg["fps"])
-            self.scale_slider.setValue(cfg["scale"])
+            self.scale_slider.setValue(self._preset_scale_pct(cfg))
             self.palette_seg.set_active(cfg["palette"])
             self.format_seg.set_active(cfg["fmt"])
             self.webp_quality.setValue(cfg["webp_q"])
+            self.transparent_row.set_checked(bool(cfg.get("transparent", False)))
+            # Only presets that name a size cap touch the Compress tab —
+            # the rest leave whatever the user set there alone.
+            target_kb = cfg.get("target_kb")
+            if target_kb:
+                self.target_enabled.set_checked(True)
+                self.target_size_input.set_value_kb(int(target_kb))
         finally:
             self._suppress_preset_reset = False
+        self._sync_transparency_controls()
         self._active_preset = name
         for n, card in self._preset_cards.items():
             card.set_active(n == name)
         self._refresh_size_estimate()
+
+    def _preset_scale_pct(self, cfg: dict) -> int:
+        """Resolve a preset's scale.
+
+        Most presets carry a flat percentage. Emote-style presets instead
+        carry `max_px`, a hard pixel cap on the longest side — expressed as
+        a percentage only once the source dimensions are known. Falls back
+        to the preset's plain `scale` until a clip is loaded."""
+        max_px = cfg.get("max_px")
+        if not max_px or self._info is None:
+            return int(cfg["scale"])
+        crop = self._crop_pixels()
+        src_w, src_h = (crop[2], crop[3]) if crop else (self._info.width, self._info.height)
+        longest = max(src_w, src_h)
+        if longest <= max_px:
+            return 100
+        pct = int(round(max_px / longest * 100))
+        return max(self.scale_slider.minimum(), min(100, pct))
 
     def _on_setting_changed(self) -> None:
         if not self._suppress_preset_reset and self._active_preset is not None:
@@ -1931,9 +2081,125 @@ class MainWindow(QMainWindow):
         self.webp_quality.setEnabled(is_webp)
         self._quality_value_lbl.setEnabled(is_webp)
         self.palette_seg.setEnabled(fmt == "GIF")
+        # The transparency hint differs per format (soft alpha vs 1-bit).
+        self._sync_transparency_controls()
         # Update Convert button label, including any target-size suffix.
         self._refresh_convert_button_label()
         self._on_setting_changed()
+
+    # -----------------------------------------------------------------
+    # Transparency / color key
+    # -----------------------------------------------------------------
+
+    def _transparency(self) -> "ff.Transparency | None":
+        """The color-key config for the next export, or None when off."""
+        if not self.transparent_row.is_checked():
+            return None
+        return ff.Transparency(
+            color=self.key_color_btn.hex(),
+            similarity=self.key_similarity.value() / 100.0,
+            blend=self.key_blend.value() / 100.0,
+        )
+
+    def _on_transparency_toggled(self, on: bool) -> None:
+        self._sync_transparency_controls()
+        if not on and self.key_pick_btn.isChecked():
+            self.key_pick_btn.setChecked(False)
+        # Turning it on with nothing detected yet (e.g. the user loaded the
+        # clip before the guess landed) — take another look now.
+        if on and self._key_guess is None and self._video_path is not None:
+            self._start_key_detection(self._video_path)
+        self._on_setting_changed()
+
+    def _on_key_tolerance_changed(self) -> None:
+        self._key_similarity_lbl.setText(f"{self.key_similarity.value()}%")
+        self._on_setting_changed()
+
+    def _on_key_blend_changed(self) -> None:
+        self._key_blend_lbl.setText(f"{self.key_blend.value()}%")
+        self._on_setting_changed()
+
+    def _on_autodetect_key_clicked(self) -> None:
+        if self._video_path is None:
+            return
+        # Asking for a fresh guess outranks an earlier hand-picked color —
+        # otherwise the button appears to do nothing after using Pick.
+        self._key_color_user_set = False
+        self._key_detect_hint = "Detecting backdrop…"
+        self._key_hint.setText(self._key_detect_hint)
+        self._start_key_detection(self._video_path)
+
+    def _start_key_detection(self, path: Path) -> None:
+        """Guess the backdrop color off the UI thread.
+
+        Sampled at the trim start rather than t=0 so the guess reflects the
+        part of the clip actually being exported."""
+        from . import keying  # local import — keeps startup import cheap
+        if self._key_detect_thread is not None:
+            try:
+                self._key_detect_thread.detected.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+            self._key_detect_thread = None
+        at = self.trim_bar.start() if self._info is not None else 0.0
+        worker = keying.KeyDetectWorker(path, at_time=at, parent=self)
+        worker.detected.connect(self._on_key_detected, Qt.QueuedConnection)
+        self._key_detect_thread = worker
+        worker.start()
+
+    def _on_key_detected(self, path: Path, guess) -> None:  # noqa: ANN001
+        self._key_detect_thread = None
+        # A newer clip may have been loaded while detection was running.
+        if self._video_path is None or Path(path) != self._video_path:
+            return
+        self._key_guess = guess
+        if guess is None:
+            self._key_detect_hint = (
+                "No flat backdrop found — pick the key color by hand."
+            )
+        else:
+            # Only overwrite the swatch when the user hasn't hand-picked
+            # one for this clip; clobbering a deliberate choice with a
+            # guess would be worse than being slightly stale.
+            if not self._key_color_user_set:
+                self.key_color_btn.set_hex(guess.color)
+            pct = int(round(guess.confidence * 100))
+            self._key_detect_hint = (
+                f"Detected {guess.color} backdrop ({pct}% of the border) — "
+                f"flip the toggle to key it out."
+            )
+        self._sync_transparency_controls()
+
+    def _on_eyedropper_toggled(self, on: bool) -> None:
+        self._eyedropper = bool(on)
+        if on:
+            self.video_view.viewport().setCursor(Qt.CrossCursor)
+            self._key_hint.setText("Click the background in the preview…")
+        else:
+            self.video_view.viewport().unsetCursor()
+            self._sync_transparency_controls()
+
+    def _pick_key_color_at(self, view_pos) -> None:  # noqa: ANN001
+        """Sample the clicked preview pixel and adopt it as the key color.
+
+        The graphics scene is set up in source-pixel coordinates (see
+        `VideoView.set_native_size`), so mapping the click to the scene
+        gives us source pixels directly — no manual letterbox math."""
+        if self._video_path is None or self._info is None:
+            return
+        from . import keying  # local import — keeps startup import cheap
+        pt = self.video_view.mapToScene(view_pos)
+        x, y = int(pt.x()), int(pt.y())
+        if not (0 <= x < self._info.width and 0 <= y < self._info.height):
+            return
+        at = self.player.position() / 1000.0
+        color = keying.sample_color_at(self._video_path, at, x, y)
+        self.key_pick_btn.setChecked(False)
+        if color is None:
+            self.status.showMessage("Couldn't read that pixel", 3000)
+            return
+        self._key_color_user_set = True
+        self.key_color_btn.set_hex(color)
 
     # -----------------------------------------------------------------
     # Caption
@@ -2071,6 +2337,8 @@ class MainWindow(QMainWindow):
         flags = []
         if self.boomerang_row.is_checked():
             flags.append("↻")
+        if self.transparent_row.is_checked():
+            flags.append("alpha")
         flags_text = (" · " + " ".join(flags)) if flags else ""
         self._est_dim.setText(f"{w}×{h} · {self.format_seg.active()}{flags_text}")
 
@@ -2164,6 +2432,7 @@ class MainWindow(QMainWindow):
             crop=self._crop_pixels() if primary else None,
             reverse=self.reverse_row.is_checked(),
             boomerang=self.boomerang_row.is_checked(),
+            transparency=self._transparency(),
             captions=self._build_captions(),
             source_width=source_w,
             source_height=source_h,
@@ -2314,10 +2583,13 @@ class MainWindow(QMainWindow):
             self.fps_stepper, self.scale_slider, self.palette_seg,
             self.speed_seg, self.loop_seg, self.format_seg,
             self.convert_btn,
-            self.boomerang_row, self.reverse_row,
+            self.boomerang_row, self.reverse_row, self.transparent_row,
             self.caption_edit, self.caption_text_color, self.caption_outline_color,
         ):
             w.setEnabled(loaded)
+        # Key color / tolerance / blend follow the toggle as well as the
+        # loaded state, so they get their own pass.
+        self._sync_transparency_controls()
         # Preset cards always selectable as long as the app is alive — they
         # reset settings even when no clip is loaded so the user can preview
         # what each preset implies.
@@ -2358,6 +2630,16 @@ class MainWindow(QMainWindow):
 
     def eventFilter(self, obj, event) -> bool:  # noqa: ANN001
         et = event.type()
+        # Eyedropper takes priority over the click-to-play handler so the
+        # video doesn't start playing under the pixel being sampled.
+        if (
+            self._eyedropper
+            and et == QEvent.MouseButtonPress
+            and obj is self.video_view.viewport()
+            and event.button() == Qt.LeftButton
+        ):
+            self._pick_key_color_at(event.position().toPoint())
+            return True
         if et in (QEvent.DragEnter, QEvent.DragMove):
             if event.mimeData().hasUrls() and any(
                 u.toLocalFile() for u in event.mimeData().urls()

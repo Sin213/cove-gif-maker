@@ -36,6 +36,9 @@ class ConvertJob:
     crop: tuple[int, int, int, int] | None = None  # x, y, w, h in source pixels
     reverse: bool = False
     boomerang: bool = False
+    # Color-key config, or None to leave the background opaque. Set this to
+    # recover the transparency an MP4 source can't carry.
+    transparency: ff.Transparency | None = None
     captions: list[ff.Caption] = field(default_factory=list)
     # Source video dimensions — required when captions are set so the
     # renderer can produce the burn-in PNG at the right resolution. App
@@ -199,7 +202,7 @@ class ConvertWorker(QObject):
                     job.video, job.start, job.end, palette,
                     fps=job.fps, scale_pct=job.scale_pct, speed=job.speed,
                     palette_colors=job.palette_colors, crop=job.crop,
-                    caption_png=caption_png,
+                    caption_png=caption_png, transparency=job.transparency,
                 ),
                 phase_start=0, phase_span=30,
             )
@@ -212,7 +215,7 @@ class ConvertWorker(QObject):
                     fps=job.fps, scale_pct=job.scale_pct, speed=job.speed,
                     loop=job.loop, crop=job.crop,
                     reverse=job.reverse, boomerang=job.boomerang,
-                    caption_png=caption_png,
+                    caption_png=caption_png, transparency=job.transparency,
                 ),
                 phase_start=30, phase_span=60,
                 dur_multiplier=2.0 if job.boomerang else 1.0,
@@ -237,7 +240,7 @@ class ConvertWorker(QObject):
                     fps=job.fps, scale_pct=job.scale_pct, speed=job.speed,
                     loop=job.loop, quality=job.webp_quality, crop=job.crop,
                     reverse=job.reverse, boomerang=job.boomerang,
-                    caption_png=caption_png,
+                    caption_png=caption_png, transparency=job.transparency,
                 ),
                 phase_start=0, phase_span=100,
                 dur_multiplier=2.0 if job.boomerang else 1.0,
