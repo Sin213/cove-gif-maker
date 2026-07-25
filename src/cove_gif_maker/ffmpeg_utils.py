@@ -64,6 +64,38 @@ def has_gifsicle() -> bool:
     return _find_binary("gifsicle") is not None
 
 
+# Cache for `_frame_rate_mode_args` — the probe shells out, and the answer
+# can't change while the process is alive.
+_FPS_MODE_SUPPORTED: bool | None = None
+
+
+def _frame_rate_mode_args() -> list[str]:
+    """Flags telling the encoder to pass frame timing through untouched.
+
+    This used to be a hardcoded `-vsync 0`, but ffmpeg removed that
+    deprecated alias, and the release builds bundle ffmpeg *master* — so a
+    hardcoded `-vsync` makes every WebP export die with "Unrecognized
+    option 'vsync'". `-fps_mode` is the replacement, available since ffmpeg
+    5.0; we probe for it rather than assume, because a from-source install
+    on an older distro (Ubuntu 22.04 ships 4.4) only has the old spelling.
+    """
+    global _FPS_MODE_SUPPORTED
+    if _FPS_MODE_SUPPORTED is None:
+        try:
+            out = subprocess.run(
+                [require_ffmpeg(), "-hide_banner", "-h", "full"],
+                capture_output=True, text=True, timeout=15, **_SUBPROCESS_KWARGS,
+            )
+            _FPS_MODE_SUPPORTED = "fps_mode" in (out.stdout + out.stderr)
+        except (OSError, subprocess.SubprocessError, FFmpegMissingError):
+            # Probe failed — assume the modern spelling, since that's what
+            # every bundled build uses.
+            _FPS_MODE_SUPPORTED = True
+    if _FPS_MODE_SUPPORTED:
+        return ["-fps_mode", "passthrough"]
+    return ["-vsync", "0"]
+
+
 def gifsicle_path() -> str | None:
     return _find_binary("gifsicle")
 
@@ -172,6 +204,26 @@ def extract_thumbnail(video: Path, time: float, out: Path, height: int = 80) -> 
     subprocess.run(cmd, check=True, capture_output=True, **_SUBPROCESS_KWARGS)
 
 
+def extract_frame_png(video: Path, time: float, out: Path) -> None:
+    """Write a single lossless frame at `time` as PNG.
+
+    Used by the transparency key-color picker: JPEG's chroma subsampling
+    would shift the very pixel values we're trying to match, so this is
+    deliberately PNG rather than reusing `extract_thumbnail`. Full source
+    resolution — the caller samples exact pixels out of it."""
+    cmd = [
+        require_ffmpeg(),
+        "-y",
+        "-ss", f"{time:.3f}",
+        "-i", str(video),
+        "-frames:v", "1",
+        "-c:v", "png",
+        "-f", "image2",
+        str(out),
+    ]
+    subprocess.run(cmd, check=True, capture_output=True, **_SUBPROCESS_KWARGS)
+
+
 @dataclass
 class Caption:
     """Burnt-in text overlay configuration.
@@ -196,23 +248,71 @@ def _has_caption(caption: Caption | None) -> bool:
     return bool(caption and caption.text and caption.text.strip())
 
 
+# Discord/Tenor serve animated emotes as H.264 MP4, and MP4 has no alpha
+# channel — whatever was transparent in the original gets flattened onto
+# the site's flat backdrop (Tenor's is #32323A). Re-keying that flat color
+# back out is what turns such a clip into a usable transparent emote.
+TENOR_BACKDROP = "#32323A"
+
+# Sane defaults for a flat, compression-fuzzed backdrop. `similarity` has
+# to absorb h264 ringing around edges (the backdrop is never *exactly* one
+# value after lossy encoding); `blend` feathers the alpha ramp so the cutout
+# doesn't look stair-stepped.
+DEFAULT_KEY_SIMILARITY = 0.10
+DEFAULT_KEY_BLEND = 0.08
+
+
+@dataclass
+class Transparency:
+    """Color-key configuration that turns a flat backdrop into alpha.
+
+    `color` is "#RRGGBB". `similarity` (0..1) is how far a pixel may sit
+    from the key color and still be knocked out; `blend` (0..1) softens the
+    edge. `alpha_threshold` only matters for GIF, whose alpha is 1-bit —
+    pixels below it become the palette's transparent index."""
+    color: str = TENOR_BACKDROP
+    similarity: float = DEFAULT_KEY_SIMILARITY
+    blend: float = DEFAULT_KEY_BLEND
+    alpha_threshold: int = 128
+
+    def ffmpeg_color(self) -> str:
+        """The key color as ffmpeg's `0xRRGGBB` literal."""
+        return "0x" + self.color.lstrip("#").upper()[:6]
+
+    def filter_chain(self) -> str:
+        """`format=rgba` first so colorkey is guaranteed an alpha-bearing
+        pixel format to write into — without it ffmpeg may negotiate rgb24
+        and the keyed alpha is silently discarded."""
+        sim = min(1.0, max(0.00001, float(self.similarity)))
+        blend = min(1.0, max(0.0, float(self.blend)))
+        return f"format=rgba,colorkey={self.ffmpeg_color()}:{sim:.5f}:{blend:.5f}"
+
+
 def build_gif_filter(
     fps: int,
     scale_pct: int,
     speed: float,
     crop: tuple[int, int, int, int] | None = None,
+    transparency: Transparency | None = None,
 ) -> str:
     """Pre-paletteuse filter chain — single linear chain (no splits).
 
     Boomerang/reverse and caption overlay are NOT applied here because they
     require multi-input or split+concat structure that doesn't fit a `-vf`
     chain. Use `_wrap_loop` and the caption-input plumbing in the cmd
-    builders below."""
+    builders below.
+
+    Keying sits after `fps`/`crop` but before `scale`: after fps so we don't
+    burn cycles keying frames that are about to be dropped, and before scale
+    so the downscale resamples the alpha channel too — that's what gives the
+    cutout a smooth edge instead of a jagged one."""
     pts = 1.0 / speed
     parts = [f"setpts={pts:.4f}*PTS", f"fps={fps}"]
     if crop:
         x, y, w, h = crop
         parts.append(f"crop={w}:{h}:{x}:{y}")
+    if transparency is not None:
+        parts.append(transparency.filter_chain())
     if scale_pct != 100:
         parts.append(f"scale=iw*{scale_pct/100:.4f}:-2:flags=lanczos")
     return ",".join(parts)
@@ -268,11 +368,18 @@ def build_palettegen_cmd(
     palette_colors: int,
     crop: tuple[int, int, int, int] | None = None,
     caption_png: Path | None = None,
+    transparency: Transparency | None = None,
 ) -> list[str]:
     duration = max(0.01, end - start)
     # Palette analysis runs on the ORIGINAL frame order — boomerang/reverse
     # don't introduce new colors, so we save the doubled work.
-    base = build_gif_filter(fps, scale_pct, speed, crop)
+    base = build_gif_filter(fps, scale_pct, speed, crop, transparency)
+    palettegen = f"palettegen=max_colors={_palette_max(palette_colors, transparency)}:stats_mode=diff"
+    if transparency is not None:
+        # Hold one palette slot back for the transparent index; without this
+        # palettegen spends all N slots on visible colors and paletteuse has
+        # nothing left to map the keyed-out pixels onto.
+        palettegen += ":reserve_transparent=1"
     cmd = [
         require_ffmpeg(),
         "-y",
@@ -285,13 +392,23 @@ def build_palettegen_cmd(
         # that overlays it before palettegen — this way the caption colors
         # are included in the palette analysis.
         cmd += ["-i", str(caption_png)]
-        graph = f"[0:v]{base},palettegen=max_colors={palette_colors}:stats_mode=diff[out]"
+        graph = f"[0:v]{base},{palettegen}[out]"
         graph = _prepend_caption_overlay(graph, caption_index=1)
         cmd += ["-filter_complex", graph, "-map", "[out]", str(palette)]
     else:
-        vf = base + f",palettegen=max_colors={palette_colors}:stats_mode=diff"
+        vf = base + "," + palettegen
         cmd += ["-vf", vf, str(palette)]
     return cmd
+
+
+def _palette_max(palette_colors: int, transparency: Transparency | None) -> int:
+    """Clamp `max_colors` to leave room for the reserved transparent entry.
+
+    A GIF palette holds 256 entries total; asking for 256 opaque colors AND
+    a transparent one is one slot too many."""
+    if transparency is None:
+        return palette_colors
+    return min(palette_colors, 255)
 
 
 def build_paletteuse_cmd(
@@ -309,9 +426,15 @@ def build_paletteuse_cmd(
     reverse: bool = False,
     boomerang: bool = False,
     caption_png: Path | None = None,
+    transparency: Transparency | None = None,
 ) -> list[str]:
     duration = max(0.01, end - start)
-    base = build_gif_filter(fps, scale_pct, speed, crop)
+    base = build_gif_filter(fps, scale_pct, speed, crop, transparency)
+    paletteuse = f"paletteuse=dither={dither}"
+    if transparency is not None:
+        # GIF alpha is 1-bit, so the feathered edge colorkey produced has to
+        # be collapsed to on/off somewhere — alpha_threshold is that cutoff.
+        paletteuse += f":alpha_threshold={int(transparency.alpha_threshold)}"
     cmd = [
         require_ffmpeg(),
         "-y",
@@ -324,11 +447,11 @@ def build_paletteuse_cmd(
         cmd += ["-i", str(caption_png), "-i", str(palette)]
         seq = _wrap_loop(base, reverse=reverse, boomerang=boomerang, out_label="seq")
         seq = _prepend_caption_overlay(seq, caption_index=1)
-        graph = f"{seq};[seq][2:v]paletteuse=dither={dither}"
+        graph = f"{seq};[seq][2:v]{paletteuse}"
     else:
         cmd += ["-i", str(palette)]
         seq = _wrap_loop(base, reverse=reverse, boomerang=boomerang, out_label="seq")
-        graph = f"{seq};[seq][1:v]paletteuse=dither={dither}"
+        graph = f"{seq};[seq][1:v]{paletteuse}"
     cmd += ["-filter_complex", graph, "-loop", str(loop), str(out)]
     return cmd
 
@@ -347,9 +470,10 @@ def build_webp_cmd(
     reverse: bool = False,
     boomerang: bool = False,
     caption_png: Path | None = None,
+    transparency: Transparency | None = None,
 ) -> list[str]:
     duration = max(0.01, end - start)
-    base = build_gif_filter(fps, scale_pct, speed, crop)
+    base = build_gif_filter(fps, scale_pct, speed, crop, transparency)
     cmd = [
         require_ffmpeg(),
         "-y",
@@ -374,7 +498,15 @@ def build_webp_cmd(
         "-q:v", str(quality),
         "-loop", str(loop),
         "-an",
-        "-vsync", "0",
-        str(out),
     ]
+    cmd += _frame_rate_mode_args()
+    if transparency is not None:
+        # libwebp defaults to yuv420p, which would drop the alpha we just
+        # keyed in. Of its two alpha-capable formats, bgra beats yuva420p
+        # here: yuva420p's lossy alpha compression leaves the background at
+        # alpha=1 instead of 0 (invisible, but not actually transparent),
+        # and its chroma subsampling softens edges that emote-sized output
+        # can't spare. Costs ~2 % file size.
+        cmd += ["-pix_fmt", "bgra"]
+    cmd += [str(out)]
     return cmd

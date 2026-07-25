@@ -27,6 +27,12 @@ all four artifacts via GitHub Actions.
   a scrubbable playhead.
 - **GUI crop tool** — toggle Crop, drag a rectangle directly on the preview.
   Rule-of-thirds guides, 8 resize handles, dimmed mask outside the selection.
+- **Transparency (MP4 → transparent emote)** — MP4 can't carry an alpha
+  channel, so an emote saved from Discord or Tenor arrives with its cutout
+  flattened onto a flat backdrop. Cove detects that backdrop on load and keys
+  it back out, with a Tolerance / Edge blend pair and an eyedropper for
+  awkward sources. Paired with the **Discord Emote** preset for a 128 px,
+  ≤ 256 KB transparent GIF.
 - **Caption overlay** — add up to 2 text captions per export with drag-to-move,
   corner-resize, and rotate handle on the preview. Rendered as PNG overlays
   (works around static ffmpeg's missing drawtext filter).
@@ -84,6 +90,32 @@ GIF-optimization pass; otherwise the app just skips that step.
 Drop a different video at any time — even on top of the playing preview — to
 start over.
 
+### Making a transparent Discord emote
+
+Emotes downloaded from Discord or Tenor come down as `.mp4`, and MP4 has no
+alpha channel — whatever was transparent got flattened onto the site's flat
+backdrop (Tenor's is `#32323A`). Keying that color back out restores the
+cutout:
+
+1. Drop the MP4 in. Cove samples the border of the first frame and reports
+   what it found under **Effects → Transparency** — e.g. *"Detected #32323A
+   backdrop (84 % of the border)"*.
+2. Click the **Discord Emote** preset in the Output tab. That sets GIF at
+   128 px on the longest side, 15 fps, and a 256 KB cap, and switches the
+   transparency toggle on — Discord's animated-emoji uploader accepts GIF
+   and PNG only, never WebP.
+3. Convert. Upload the result under *Server Settings → Emoji*.
+
+If the detected color is wrong, or the source has no flat border for Cove to
+sample, hit **Pick** and click the background directly in the preview.
+
+- **Tolerance** widens the range of colors treated as background. Raise it
+  when specks of backdrop survive around the subject; lower it when parts of
+  the subject start disappearing.
+- **Edge blend** feathers the cutout boundary. Higher is softer.
+- **Auto-detect** re-samples at the current trim start — useful when the
+  clip fades in from a different color.
+
 ### Tips
 
 - **Scale** is the single biggest lever for file size — try 50 % first.
@@ -91,6 +123,12 @@ start over.
 - **Palette 128** is a good default; drop to 64 for solid-color content.
 - For longer / higher-motion clips, prefer **WebP** — typically 30–60 %
   smaller than GIF at similar quality.
+- Transparent GIF alpha is 1-bit — a pixel is either fully there or fully
+  gone. WebP keeps the soft edge, so prefer it anywhere outside Discord's
+  emoji uploader.
+- If a transparent emote can't hit 256 KB at 128 px, the target-size pass
+  will shrink it below 128. Trim the clip shorter or drop to 12 fps first —
+  both cost less than resolution does.
 
 ---
 
@@ -195,6 +233,7 @@ src/cove_gif_maker/
 ├── crop_overlay.py      draggable crop rect with rule-of-thirds guides
 ├── caption_overlay.py   drag/resize/rotate caption handles on the preview
 ├── caption_render.py    PNG overlay rendering for caption text
+├── keying.py            backdrop-color detection + eyedropper sampling
 ├── batch.py             batch export support
 ├── prefs.py             persistent user preferences
 ├── thumbnails.py        QThread worker for ffmpeg frame extraction
@@ -221,6 +260,15 @@ The conversion pipeline uses ffmpeg's two-pass palette flow:
    an optimal N-color palette.
 2. **Render** — `paletteuse` applies that palette with Sierra-2-4A dithering.
 3. **Optimize** — `gifsicle -O3` shaves a final pass when available.
+
+With transparency on, a `format=rgba,colorkey=…` step is spliced in after the
+crop and before the scale — after the crop so it only touches kept pixels, and
+before the scale so the downscale resamples the alpha channel into a smooth
+edge. `palettegen` then holds a slot back with `reserve_transparent=1` and
+`paletteuse` collapses the feathered alpha to GIF's 1-bit channel at
+`alpha_threshold`. WebP takes the same keyed stream but encodes it as `bgra`,
+whose lossless alpha avoids the `alpha=1`-instead-of-`0` background that
+`yuva420p`'s lossy alpha leaves behind.
 
 Progress is parsed from `ffmpeg -progress pipe:1` for steady incremental
 updates, and ETA is derived from elapsed wall time vs. completion percentage

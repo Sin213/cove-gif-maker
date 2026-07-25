@@ -698,6 +698,12 @@ class CoveSlider(QWidget):
         self._max = int(hi)
         self.setValue(self._value)
 
+    def minimum(self) -> int:
+        return self._min
+
+    def maximum(self) -> int:
+        return self._max
+
     # --- internal layout helpers ------------------------------------
 
     _TRACK_H = 4

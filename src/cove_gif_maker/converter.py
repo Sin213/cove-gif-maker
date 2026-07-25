@@ -36,6 +36,9 @@ class ConvertJob:
     crop: tuple[int, int, int, int] | None = None  # x, y, w, h in source pixels
     reverse: bool = False
     boomerang: bool = False
+    # Color-key config, or None to leave the background opaque. Set this to
+    # recover the transparency an MP4 source can't carry.
+    transparency: ff.Transparency | None = None
     captions: list[ff.Caption] = field(default_factory=list)
     # Source video dimensions — required when captions are set so the
     # renderer can produce the burn-in PNG at the right resolution. App
@@ -91,6 +94,10 @@ class ConvertWorker(QObject):
         a single pass."""
         attempts = 0
         attempt_limit = max(1, job.target_max_attempts) if job.target_size_kb > 0 else 1
+        # Derived once, from where the job started. Recomputing it per
+        # attempt would ratchet the floor down alongside the scale it is
+        # supposed to be bounding.
+        scale_floor = self._scale_floor(job.scale_pct)
         while True:
             attempts += 1
             self._reset_progress_state()
@@ -121,7 +128,7 @@ class ConvertWorker(QObject):
             # the cut on the first retry (output is way over) and back off
             # to gentler steps as we approach the target.
             overshoot = actual_kb / job.target_size_kb
-            self._tighten_job(job, overshoot=overshoot)
+            self._tighten_job(job, overshoot=overshoot, scale_floor=scale_floor)
 
     def _reset_progress_state(self) -> None:
         # Each attempt starts the progress bar from 0%.
@@ -130,7 +137,23 @@ class ConvertWorker(QObject):
         self.progress.emit(0)
 
     @staticmethod
-    def _tighten_job(job: ConvertJob, *, overshoot: float) -> None:
+    def _scale_floor(scale_pct: int) -> int:
+        """Lowest scale % the target-size ladder may cut down to.
+
+        Normally 20% — below that a GIF stops being worth looking at. But
+        emote presets resolve a hard pixel cap that can already start
+        under 20% on a large source, and those jobs would lose scale as a
+        lever entirely, leaving only fps to close the gap. For them the
+        floor drops to a quarter of where they started, so resolution
+        stays available the way it is for every other job."""
+        if scale_pct >= 20:
+            return 20
+        return max(1, scale_pct // 4)
+
+    @staticmethod
+    def _tighten_job(
+        job: ConvertJob, *, overshoot: float, scale_floor: int | None = None
+    ) -> None:
         """Reduce quality / palette / scale so the next attempt produces
         a smaller file. Mutates `job` in place.
 
@@ -142,6 +165,10 @@ class ConvertWorker(QObject):
         - GIF: halve the palette first (big win, perceptually mild), then
           drop scale. Scale is the killer lever once the palette is at 64.
         """
+        floor = (
+            scale_floor if scale_floor is not None
+            else ConvertWorker._scale_floor(job.scale_pct)
+        )
         if job.fmt == "webp":
             old_q = job.webp_quality
             cut = 0.6 if overshoot > 3.0 else (0.7 if overshoot > 2.0 else 0.85)
@@ -151,16 +178,22 @@ class ConvertWorker(QObject):
             # also reduce scale so the next pass has a real chance.
             quality_floored = (new_q == old_q == 20)
             if quality_floored or (new_q <= 30 and overshoot > 1.5):
-                if job.scale_pct > 20:
+                if job.scale_pct > floor:
                     scale_cut = 0.8 if overshoot > 2.0 else 0.9
-                    job.scale_pct = max(20, int(round(job.scale_pct * scale_cut)))
+                    job.scale_pct = max(
+                        floor, min(job.scale_pct - 1, int(round(job.scale_pct * scale_cut)))
+                    )
         else:
             # GIF: palette → scale → fps drops, in that order of impact.
             if job.palette_colors > 64:
                 job.palette_colors = max(64, job.palette_colors // 2)
-            elif job.scale_pct > 20:
+            elif job.scale_pct > floor:
                 cut = 0.7 if overshoot > 2.0 else 0.85
-                job.scale_pct = max(20, int(round(job.scale_pct * cut)))
+                # min(-1) guarantees forward progress: at small scales the
+                # multiplicative cut can round back to where it started.
+                job.scale_pct = max(
+                    floor, min(job.scale_pct - 1, int(round(job.scale_pct * cut)))
+                )
             elif job.fps > 8:
                 job.fps = max(8, job.fps - 4)
 
@@ -199,7 +232,7 @@ class ConvertWorker(QObject):
                     job.video, job.start, job.end, palette,
                     fps=job.fps, scale_pct=job.scale_pct, speed=job.speed,
                     palette_colors=job.palette_colors, crop=job.crop,
-                    caption_png=caption_png,
+                    caption_png=caption_png, transparency=job.transparency,
                 ),
                 phase_start=0, phase_span=30,
             )
@@ -212,7 +245,7 @@ class ConvertWorker(QObject):
                     fps=job.fps, scale_pct=job.scale_pct, speed=job.speed,
                     loop=job.loop, crop=job.crop,
                     reverse=job.reverse, boomerang=job.boomerang,
-                    caption_png=caption_png,
+                    caption_png=caption_png, transparency=job.transparency,
                 ),
                 phase_start=30, phase_span=60,
                 dur_multiplier=2.0 if job.boomerang else 1.0,
@@ -237,7 +270,7 @@ class ConvertWorker(QObject):
                     fps=job.fps, scale_pct=job.scale_pct, speed=job.speed,
                     loop=job.loop, quality=job.webp_quality, crop=job.crop,
                     reverse=job.reverse, boomerang=job.boomerang,
-                    caption_png=caption_png,
+                    caption_png=caption_png, transparency=job.transparency,
                 ),
                 phase_start=0, phase_span=100,
                 dur_multiplier=2.0 if job.boomerang else 1.0,
